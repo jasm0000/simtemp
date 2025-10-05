@@ -5,17 +5,40 @@
 #include <linux/miscdevice.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
+#include <linux/random.h>
 
 
 /************************ MACROS DEFINITIONS **************************/
 
 #define VERSION "b001"
+#define tmprStubbedTemp 14000
+
+/*********************************************************************/
+/********************  FUNCTION PROTOTYPES ***************************/
+/*********************************************************************/
+
+static int tmprSampleReadADC(void);
+static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t *off);
+static int simtempOpen(struct inode *ino, struct file *f);
+static int simtempRelease(struct inode *ino, struct file *f);
+
 
 
 /************************ GLOBAL VARIABLES ****************************/
 
 char arreglito[20] = "0123456789ABCDEFG\n";
 struct delayed_work readSampleTimer;
+
+// Device operations table
+static const struct file_operations simtempFOps = {
+    .owner   = THIS_MODULE,
+    .read    = simtempRead,
+    .open    = simtempOpen,
+    .release = simtempRelease,
+};
+
+int tmprBase = tmprStubbedTemp;
+
 
 /*********************************************************************/
 
@@ -24,8 +47,6 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jorge Sanchez");
 MODULE_DESCRIPTION("miscdevice /dev/simtemp");
 MODULE_VERSION(VERSION);
-
-
 
 
 /*********************************************************************/
@@ -44,7 +65,7 @@ static void timerReset(void)
 static void readSampleTimerCallback(struct work_struct *work)
 {
     static char simCnt = 0;
-    printk(KERN_INFO "Timer ejecutado, muestra numero: %i\n",simCnt++);
+    pr_info("Timer ejecutado, muestra numero: %i = %i\n",simCnt++, tmprSampleReadADC());
     timerReset();
 }
 
@@ -61,6 +82,20 @@ static void timerInit(void)
 static void timerDeInit(void)
 {
     cancel_delayed_work_sync(&readSampleTimer);
+}
+
+/*********************************************************************/
+/*********************************************************************/
+/*************** TEMPERATURE SAMPLES HANDLING ************************/
+/*********************************************************************/
+/*********************************************************************/
+
+static int tmprSampleReadADC(void)
+{
+    // u32 r = prandom_u32() % 1001;
+    u32 r = get_random_u32() % 1001;
+    return tmprBase + r;
+
 }
 
 /*********************************************************************/
@@ -95,13 +130,6 @@ static int simtempRelease(struct inode *ino, struct file *f)
     return 0;
 }
 
-// Tabla de operaciones
-static const struct file_operations simtempFOps = {
-    .owner   = THIS_MODULE,
-    .read    = simtempRead,
-    .open    = simtempOpen,
-    .release = simtempRelease,
-};
 
 // miscdevice crea /dev/simtemp automáticamente
 static struct miscdevice simtempMiscDev = {
