@@ -6,12 +6,18 @@
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 #include <linux/random.h>
+#include <linux/spinlock.h>
+
 
 
 /************************ MACROS DEFINITIONS **************************/
 
 #define VERSION "b001"
 #define tmprStubbedTemp 14000
+#define TMPR_SMPL_CIRC_BUFF_SIZE 14000
+#define TRUE  1
+#define FALSE 0
+
 
 /*********************************************************************/
 /********************  FUNCTION PROTOTYPES ***************************/
@@ -38,6 +44,13 @@ static const struct file_operations simtempFOps = {
 };
 
 int tmprBase = tmprStubbedTemp;
+int tmprSmplCircBuff[TMPR_SMPL_CIRC_BUFF_SIZE] = {0};   // Samples circular buffer
+spinlock_t tmprSmplBuffLock;                            // Spinlock to make exclusie areas 
+                                                        // when producing and consuming last sample
+int tmprLastSample = 0xFFFFFFFF;
+char simCnt = 0;
+int tmprNewSample = 0xFFFFFFFF;
+char newSampleFlag = FALSE;
 
 
 /*********************************************************************/
@@ -64,9 +77,16 @@ static void timerReset(void)
 
 static void readSampleTimerCallback(struct work_struct *work)
 {
-    static char simCnt = 0;
-    pr_info("Timer ejecutado, muestra numero: %i = %i\n",simCnt++, tmprSampleReadADC());
     timerReset();
+    tmprNewSample = tmprSampleReadADC();
+    pr_info("Timer ejecutado, muestra numero: %i = %i\n",simCnt++, tmprNewSample);
+    //if (cbHead)
+    //tmprSmplCircBuff[cbHead++] = sample;
+
+    spin_lock(&tmprSmplBuffLock);
+    newSampleFlag = TRUE;
+    tmprLastSample = tmprNewSample;
+    spin_unlock(&tmprSmplBuffLock);
 }
 
 /******************** TIMER INIT ********************************/
@@ -74,6 +94,7 @@ static void readSampleTimerCallback(struct work_struct *work)
 static void timerInit(void)
 {
     INIT_DELAYED_WORK(&readSampleTimer, readSampleTimerCallback);
+    spin_lock_init(&tmprSmplBuffLock);
     timerReset();
 }
 
@@ -110,6 +131,25 @@ static int tmprSampleReadADC(void)
 
 static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t *off)
 {
+    ssize_t retVal = 0;
+    char auxStr[10] = {0};
+    spin_lock(&tmprSmplBuffLock);
+    if (TRUE == newSampleFlag)
+    {
+        retVal = sizeof(tmprSmplBuffLock);
+    }
+    tmprLastSample = tmprNewSample;
+    newSampleFlag = FALSE;
+    spin_unlock(&tmprSmplBuffLock);
+    
+    snprintf(auxStr, sizeof(auxStr), "%d\n", tmprLastSample);
+    if (retVal != 0)
+    {
+        retVal = 10;
+//        copy_to_user(buf, &tmprLastSample, sizeof(tmprSmplBuffLock));
+        copy_to_user(buf, auxStr, retVal);
+    }
+    return retVal;
     return -EAGAIN;
 }
 
@@ -134,7 +174,7 @@ static int simtempRelease(struct inode *ino, struct file *f)
 // miscdevice crea /dev/simtemp automáticamente
 static struct miscdevice simtempMiscDev = {
     .minor = MISC_DYNAMIC_MINOR,
-    .name  = "Temperature simulator",
+    .name  = "simtemp",
     .fops  = &simtempFOps,
     .mode  = 0666,     //  Read write permissions for everybody
 };
@@ -147,6 +187,7 @@ static int __init simtempInit(void)
         pr_err("simtemp: misc_register failed (%d)\n", retVal);
         return retVal;
     }
+
     timerInit();
     pr_info("simtemp: Loaded. /dev/simtemp Ready "VERSION"\n");
     return 0;
