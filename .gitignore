@@ -1,0 +1,16 @@
+# Build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+Module.symvers
+modules.order
+.*.cmd
+*.cmd
+
+# Editor/OS junk
+*.swp
+*.swo
+.DS_Store
