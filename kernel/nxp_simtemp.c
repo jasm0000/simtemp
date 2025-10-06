@@ -7,34 +7,53 @@
 #include <linux/workqueue.h>
 #include <linux/random.h>
 #include <linux/spinlock.h>
+#include <linux/types.h>
 
 
 
-/************************ MACROS DEFINITIONS **************************/
+/************************* MACRO DEFINITIONS **************************/
 
 #define VERSION "b001"
 #define tmprStubbedTemp 14000
 #define TMPR_SMPL_CIRC_BUFF_SIZE 14000
 #define TRUE  1
 #define FALSE 0
+#define u64 __u64
+#define s32 __s32
+#define u32 __u32
+
+#define MASK_NEW_SMPL 1       // NEW SAMPLE FLAG MASK
+
+
+
+
+/*********************************************************************/
+/********************  TYPES DEFINITIONS *****************************/
+/*********************************************************************/
+
+struct simtempSample {
+    u64 timestampNS;   // monotonic timestamp
+    s32 tempMC;        // milli-degree Celsius (e.g., 44123 = 44.123 °C)
+    u32 flags;         // bit0=NEW_SAMPLE, bit1=THRESHOLD_CROSSED (extend as needed)
+} __attribute__((packed));
 
 
 /*********************************************************************/
 /********************  FUNCTION PROTOTYPES ***************************/
 /*********************************************************************/
 
-static int tmprSampleReadADC(void);
+static s32 tmprSampleReadADC(void);
 static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t *off);
 static int simtempOpen(struct inode *ino, struct file *f);
 static int simtempRelease(struct inode *ino, struct file *f);
 
 
 
+/**********************************************************************/
 /************************ GLOBAL VARIABLES ****************************/
+/**********************************************************************/
 
-char arreglito[20] = "0123456789ABCDEFG\n";
 struct delayed_work readSampleTimer;
-
 // Device operations table
 static const struct file_operations simtempFOps = {
     .owner   = THIS_MODULE,
@@ -43,13 +62,22 @@ static const struct file_operations simtempFOps = {
     .release = simtempRelease,
 };
 
-int tmprBase = tmprStubbedTemp;
-int tmprSmplCircBuff[TMPR_SMPL_CIRC_BUFF_SIZE] = {0};   // Samples circular buffer
+static struct miscdevice simtempMiscDev = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name  = "simtemp",
+    .fops  = &simtempFOps,
+    .mode  = 0666,     //  Read write permissions for everybody
+};
+
+
+s32 tmprBase = tmprStubbedTemp;
+struct simtempSample tmprSmplCircBuff[TMPR_SMPL_CIRC_BUFF_SIZE] = {0};   // Samples circular buffer
 spinlock_t tmprSmplBuffLock;                            // Spinlock to make exclusie areas 
                                                         // when producing and consuming last sample
-int tmprLastSample = 0xFFFFFFFF;
 char simCnt = 0;
-int tmprNewSample = 0xFFFFFFFF;
+s32 tmprNewSample = 0xFFFFFFFF;
+struct simtempSample sampleNew;
+struct simtempSample tmprLastSample;
 char newSampleFlag = FALSE;
 
 
@@ -79,14 +107,19 @@ static void readSampleTimerCallback(struct work_struct *work)
 {
     timerReset();
     tmprNewSample = tmprSampleReadADC();
-    pr_info("Timer ejecutado, muestra numero: %i = %i\n",simCnt++, tmprNewSample);
+    sampleNew.tempMC = tmprNewSample;
+    sampleNew.timestampNS = ktime_get_ns();
+    sampleNew.flags = 1;
+
+    pr_info("Timer ejecutado, muestra numero: %i = %i, at: %llu\n",simCnt++, tmprNewSample, sampleNew.timestampNS);
     //if (cbHead)
     //tmprSmplCircBuff[cbHead++] = sample;
 
     spin_lock(&tmprSmplBuffLock);
-    newSampleFlag = TRUE;
-    tmprLastSample = tmprNewSample;
+    tmprLastSample = sampleNew;
     spin_unlock(&tmprSmplBuffLock);
+
+    
 }
 
 /******************** TIMER INIT ********************************/
@@ -111,10 +144,10 @@ static void timerDeInit(void)
 /*********************************************************************/
 /*********************************************************************/
 
-static int tmprSampleReadADC(void)
+static s32 tmprSampleReadADC(void)
 {
     // u32 r = prandom_u32() % 1001;
-    u32 r = get_random_u32() % 1001;
+    s32 r = get_random_u32() % 1001;
     return tmprBase + r;
 
 }
@@ -132,22 +165,30 @@ static int tmprSampleReadADC(void)
 static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t *off)
 {
     ssize_t retVal = 0;
-    char auxStr[10] = {0};
+    #define OUTPUT_SIZE 40
+    char auxStr[OUTPUT_SIZE] = {0};
+    unsigned long notCopied;
+
     spin_lock(&tmprSmplBuffLock);
-    if (TRUE == newSampleFlag)
-    {
-        retVal = sizeof(tmprSmplBuffLock);
+    if (MASK_NEW_SMPL == (tmprLastSample.flags & MASK_NEW_SMPL))
+    {   
+        retVal = sizeof(tmprLastSample);
     }
-    tmprLastSample = tmprNewSample;
-    newSampleFlag = FALSE;
+    tmprLastSample = sampleNew;
+    tmprLastSample.flags = tmprLastSample.flags & (!(MASK_NEW_SMPL));
     spin_unlock(&tmprSmplBuffLock);
     
-    snprintf(auxStr, sizeof(auxStr), "%d\n", tmprLastSample);
+    snprintf(auxStr, sizeof(auxStr), "%d, at: %llu\n", tmprLastSample.tempMC, tmprLastSample.timestampNS);
     if (retVal != 0)
     {
-        retVal = 10;
+        retVal = OUTPUT_SIZE;
 //        copy_to_user(buf, &tmprLastSample, sizeof(tmprSmplBuffLock));
-        copy_to_user(buf, auxStr, retVal);
+        notCopied = copy_to_user(buf, auxStr, OUTPUT_SIZE);
+        if (notCopied)
+        {
+            return -EFAULT;
+        }
+        
     }
     return retVal;
     return -EAGAIN;
@@ -170,14 +211,8 @@ static int simtempRelease(struct inode *ino, struct file *f)
     return 0;
 }
 
+/******************* DEVICE INIT OPERATION ************************/
 
-// miscdevice crea /dev/simtemp automáticamente
-static struct miscdevice simtempMiscDev = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = "simtemp",
-    .fops  = &simtempFOps,
-    .mode  = 0666,     //  Read write permissions for everybody
-};
 
 static int __init simtempInit(void)
 {
