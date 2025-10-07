@@ -15,7 +15,7 @@
 
 #define VERSION "b001"
 #define tmprStubbedTemp 14000
-#define TMPR_SMPL_CIRC_BUFF_SIZE 14000
+#define TMPR_SMPL_CIRC_BUFF_SIZE 20
 #define TRUE  1
 #define FALSE 0
 #define u64 __u64
@@ -35,6 +35,7 @@ struct simtempSample {
     u64 timestampNS;   // monotonic timestamp
     s32 tempMC;        // milli-degree Celsius (e.g., 44123 = 44.123 °C)
     u32 flags;         // bit0=NEW_SAMPLE, bit1=THRESHOLD_CROSSED (extend as needed)
+    char consecutive;
 } __attribute__((packed));
 
 
@@ -81,6 +82,10 @@ struct simtempSample tmprLastSample;
 char newSampleFlag = FALSE;
 
 
+u32 cbHead = 0;
+u32 cbTail = 0;
+
+
 /*********************************************************************/
 
 
@@ -105,20 +110,37 @@ static void timerReset(void)
 
 static void readSampleTimerCallback(struct work_struct *work)
 {
-    timerReset();
-    tmprNewSample = tmprSampleReadADC();
-    sampleNew.tempMC = tmprNewSample;
-    sampleNew.timestampNS = ktime_get_ns();
-    sampleNew.flags = 1;
+   timerReset();
+   tmprNewSample = tmprSampleReadADC();
+   sampleNew.tempMC = tmprNewSample;
+   sampleNew.timestampNS = ktime_get_ns();
+   sampleNew.flags = 1;
+   sampleNew.consecutive = simCnt;
+   s32 lostSample = -1;
 
-    pr_info("Timer ejecutado, muestra numero: %i = %i, at: %llu\n",simCnt++, tmprNewSample, sampleNew.timestampNS);
-    //if (cbHead)
-    //tmprSmplCircBuff[cbHead++] = sample;
+   pr_info("Timer ejecutado, muestra numero: %i = %i, at: %llu\n",simCnt++, tmprNewSample, sampleNew.timestampNS);
+    
+   // head always point to the next position to be written in the circ buffer
+   spin_lock(&tmprSmplBuffLock);
+   tmprSmplCircBuff[cbHead] = sampleNew;  // write new sample in next position in circ buffer
+   if (cbTail == ((cbHead + 1) % TMPR_SMPL_CIRC_BUFF_SIZE))
+   {  // if tail is next to head, means that we will start to loose samples
+      // because whole circ buffer is not yet read by consumer
+      lostSample = tmprSmplCircBuff[cbTail].consecutive;
+      cbTail = ((cbHead + 2) % TMPR_SMPL_CIRC_BUFF_SIZE);
+   }
+   cbHead = (cbHead + 1) % TMPR_SMPL_CIRC_BUFF_SIZE;
+   spin_unlock(&tmprSmplBuffLock);
+    
+   if (lostSample != -1)
+      pr_info("Se perdió la %i \n",lostSample);
 
-    spin_lock(&tmprSmplBuffLock);
-    tmprLastSample = sampleNew;
-    spin_unlock(&tmprSmplBuffLock);
+   /*
 
+   spin_lock(&tmprSmplBuffLock);
+   tmprLastSample = sampleNew;
+   spin_unlock(&tmprSmplBuffLock);
+   /**/
     
 }
 
@@ -164,10 +186,30 @@ static s32 tmprSampleReadADC(void)
 
 static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t *off)
 {
-    ssize_t retVal = 0;
     #define OUTPUT_SIZE 40
+    ssize_t retVal = OUTPUT_SIZE;
     char auxStr[OUTPUT_SIZE] = {0};
     unsigned long notCopied;
+
+
+
+   struct simtempSample auxSample;
+
+   spin_lock(&tmprSmplBuffLock);
+   if (cbTail == cbHead)
+   {
+      spin_unlock(&tmprSmplBuffLock);
+      return 0;
+   }
+   tmprLastSample = tmprSmplCircBuff[cbTail];
+   cbTail = ((cbTail + 1) % TMPR_SMPL_CIRC_BUFF_SIZE);
+   spin_unlock(&tmprSmplBuffLock);
+
+
+   
+
+
+   /*
 
     spin_lock(&tmprSmplBuffLock);
     if (MASK_NEW_SMPL == (tmprLastSample.flags & MASK_NEW_SMPL))
@@ -177,8 +219,10 @@ static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t 
     tmprLastSample = sampleNew;
     tmprLastSample.flags = tmprLastSample.flags & (!(MASK_NEW_SMPL));
     spin_unlock(&tmprSmplBuffLock);
+
+    /**/
     
-    snprintf(auxStr, sizeof(auxStr), "%d, at: %llu\n", tmprLastSample.tempMC, tmprLastSample.timestampNS);
+    snprintf(auxStr, sizeof(auxStr), "%i %d, at: %llu\n", tmprLastSample.consecutive, tmprLastSample.tempMC, tmprLastSample.timestampNS);
     if (retVal != 0)
     {
         retVal = OUTPUT_SIZE;
@@ -192,7 +236,10 @@ static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t 
     }
     return retVal;
     return -EAGAIN;
-}
+
+
+
+   }
 
 /******************* DEVICE OPEN OPERATION ***************************/
 
