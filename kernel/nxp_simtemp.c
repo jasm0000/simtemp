@@ -31,8 +31,16 @@
 
 // DT macros
 #define SIMTEMP_COMPATIBLE           "nxp,simtemp"
-#define SIMTEMP_DEFAULT_SAMPLING_MS  3000U
+#define SIMTEMP_SAMPLING_MS_DEFAULT  3000U
+#define SIMTEMP_SAMPLING_MS_MAX      60000U
+#define SIMTEMP_SAMPLING_MS_MIN      5U
+
 #define SIMTEMP_DEFAULT_THRESH_mC    45000
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Jorge Sanchez");
+MODULE_DESCRIPTION("miscdevice /dev/simtemp");
+MODULE_VERSION(VERSION);
 
 
 /*********************************************************************/
@@ -69,20 +77,11 @@ MODULE_DEVICE_TABLE(of, simtemp_of_match);
 /**********************************************************************/
 
 struct delayed_work readSampleTimer;
-/*
-static struct miscdevice simtempMiscDev = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = "simtemp",
-    .fops  = &simtempFOps,
-    .mode  = 0666,     //  Read write permissions for everybody
-};
-*/
-
-
 s32 tmprBase = TMP_STUBBED_TEMPERATURE;
 struct simtempSample tmprSmplCircBuff[TMPR_SMPL_CIRC_BUFF_SIZE] = {0};   // Samples circular buffer
 spinlock_t tmprSmplBuffLock;                            // Spinlock to make exclusie areas 
                                                         // when producing and consuming last sample
+spinlock_t sysfsLock;
 char simCnt = 0;
 s32 tmprNewSample = 0xFFFFFFFF;
 struct simtempSample sampleNew;
@@ -93,7 +92,7 @@ char newSampleFlag = FALSE;
 u32 cbHead = 0;
 u32 cbTail = 0;
 
-u32 globalParam_SmplRate = SIMTEMP_DEFAULT_SAMPLING_MS;
+u32 globalParam_SmplRate = SIMTEMP_SAMPLING_MS_DEFAULT;
 int globalParam_tmprTreshold = SIMTEMP_DEFAULT_THRESH_mC;
 
 
@@ -117,6 +116,28 @@ static const struct file_operations simtempFOps = {
     .release = simtempRelease,
 };
 
+static struct miscdevice simtempMiscDev = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name  = "simtemp",
+    .fops  = &simtempFOps,
+    .mode  = 0666,     //  Read write permissions for everybody
+};
+
+
+
+/*********************************************************************/
+/******************************* SYSFS *******************************/
+/*********************************************************************/
+
+ssize_t samplingMsStore(struct device *dev,
+                               struct device_attribute *attr,
+                               const char *buf,
+                               size_t count);
+
+
+ssize_t samplingMsShow(struct device *dev,
+                              struct device_attribute *attr,
+                              char *buf);
 
 
 /*********************************************************************/
@@ -131,7 +152,7 @@ static void simtemp_parse_dt(struct simtempDev *sd, struct device *dev)
    u32 u;
 
    /* Defaults */
-   sd->sampling_ms  = SIMTEMP_DEFAULT_SAMPLING_MS;
+   sd->sampling_ms  = SIMTEMP_SAMPLING_MS_DEFAULT;
    sd->threshold_mC = SIMTEMP_DEFAULT_THRESH_mC;
 
    if (!np)
@@ -172,12 +193,12 @@ static int simtemp_probe(struct platform_device *pdev)
 
    simtempInitFromDT(sd);    
 
-    // ret = simtemp_core_init(sd);
-    // if (ret) return ret;
+   // ret = simtemp_core_init(sd);
+   // if (ret) return ret;
 
-    dev_info(&pdev->dev, "simtemp probed: sampling_ms=%u, threshold_mC=%d\n",
-             sd->sampling_ms, sd->threshold_mC);
-    return 0;
+   dev_info(&pdev->dev, "simtemp probed: sampling_ms=%u, threshold_mC=%d\n",
+            sd->sampling_ms, sd->threshold_mC);
+   return 0;
 }
 
 static void simtemp_remove(struct platform_device *pdev)
@@ -189,32 +210,30 @@ static void simtemp_remove(struct platform_device *pdev)
    dev_info(&pdev->dev, "simtemp removed\n");
 }
 
-static struct platform_driver simtemp_platform_driver = {
-    .probe  = simtemp_probe,
-    .remove = simtemp_remove,
-    .driver = {
-        .name           = "nxp_simtemp",
-        .of_match_table = simtemp_of_match,
-    },
+static struct platform_driver simtemp_platform_driver = 
+{
+   .probe  = simtemp_probe,
+   .remove = simtemp_remove,
+   .driver = 
+   {
+      .name           = "nxp_simtemp",
+      .of_match_table = simtemp_of_match,
+   },
 };
 
 /* Fallback: crea un platform_device local si no venimos de DT */
 static struct platform_device *simtemp_pdev_fallback;
 
 
-/*********************************************************************/
-
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Jorge Sanchez");
-MODULE_DESCRIPTION("miscdevice /dev/simtemp");
-MODULE_VERSION(VERSION);
-
 void simtempInitFromDT(struct simtempDev *sd)
 {
    globalParam_SmplRate = sd->sampling_ms;
    globalParam_tmprTreshold = sd->threshold_mC;
 }
+
+
+
+/*********************************************************************/
 
 
 /*********************************************************************/
@@ -226,7 +245,13 @@ void simtempInitFromDT(struct simtempDev *sd)
 static void timerReset(void)
 {
    //schedule_delayed_work(&readSampleTimer, 2 * HZ);
-    schedule_delayed_work(&readSampleTimer, msecs_to_jiffies((unsigned long)globalParam_SmplRate));
+
+   u32 smplRate_Aux;
+   spin_lock(&sysfsLock);
+   smplRate_Aux = globalParam_SmplRate; // Using an aux variable to reduce the exclusive area time
+   spin_unlock(&sysfsLock);
+
+   schedule_delayed_work(&readSampleTimer, msecs_to_jiffies((unsigned long)smplRate_Aux));
 }
 
 /******************** TIMER CALL BACK ****************************/
@@ -271,9 +296,14 @@ static void readSampleTimerCallback(struct work_struct *work)
 
 static void timerInit(void)
 {
-    INIT_DELAYED_WORK(&readSampleTimer, readSampleTimerCallback);
-    spin_lock_init(&tmprSmplBuffLock);
-    timerReset();
+   INIT_DELAYED_WORK(&readSampleTimer, readSampleTimerCallback);
+   spin_lock_init(&tmprSmplBuffLock);
+   timerReset();
+}
+
+static void sysfsInit(void)
+{
+   spin_lock_init(&sysfsLock);
 }
 
 /******************* TIMER DE INIT ******************************/
@@ -384,28 +414,86 @@ static int simtempRelease(struct inode *ino, struct file *f)
 /******************* DEVICE INIT OPERATION ************************/
 
 
+ssize_t samplingMsShow(struct device *dev,
+                              struct device_attribute *attr,
+                              char *buf)
+{
+
+   /*
+   unsigned long flags;
+   unsigned int v;
+
+   spin_lock_irqsave(&sd.lock, flags);
+   v = sd.samplingMs;
+   spin_unlock_irqrestore(&sd.lock, flags);
+
+   return scnprintf(buf, PAGE_SIZE, "%u\n", v);
+
+   */
+   return (ssize_t)0;
+}
+
+ssize_t samplingMsStore(struct device *dev,
+                               struct device_attribute *attr,
+                               const char *buf,
+                               size_t count)
+{
+   unsigned int val;
+   u32 oldVal;
+   int ret = kstrtouint(buf, 0, &val);
+   if (ret)
+      return ret;
+
+   // Validate limits
+   if (val < SIMTEMP_SAMPLING_MS_MIN || val > SIMTEMP_SAMPLING_MS_MAX)
+   {
+      return -EINVAL;
+   }
+      
+   oldVal = globalParam_SmplRate;
+   spin_lock(&sysfsLock);
+   globalParam_SmplRate = val;
+   spin_unlock(&sysfsLock);
+
+   pr_info("SYSFS: Sample rate was updated from %u to %u\n", oldVal, globalParam_SmplRate);
+
+   return count;
+}
+
+
+
+static struct device_attribute samplingMsAttr =
+   __ATTR(sampling_ms, 0664, samplingMsShow, samplingMsStore);
+
+
 static int __init simtempInit(void)
 {
-   /*
+   
    int retVal = misc_register(&simtempMiscDev);
-    if (retVal) 
-    {
-        pr_err("simtemp: misc_register failed (%d)\n", retVal);
-        return retVal;
-    }
+   if (retVal) 
+   {
+      pr_err("simtemp: misc_register failed (%d)\n", retVal);
+      return retVal;
+   }
 
-    */
+   /* crear el atributo sysfs /sys/class/misc/simtemp/sampling_ms */
+   retVal = device_create_file(simtempMiscDev.this_device, &samplingMsAttr);
+   if (retVal)
+   {
+      pr_err("simtemp: device_create_file(sampling_ms) failed (%d)\n", retVal);
+      misc_deregister(&simtempMiscDev);
+      return retVal;
+   }
+
 
 
    pr_info("INIT: Iniciando\n");
 
-   int ret;
-
-   ret = platform_driver_register(&simtemp_platform_driver);
-   if (ret)
+   retVal = platform_driver_register(&simtemp_platform_driver);
+   if (retVal)
    {
       pr_info("INIT: falló ret = platform_driver_register(&simtemp_platform_driver); fin de INIT\n");
-      return ret;
+      return retVal;
    }
 
 
@@ -417,9 +505,9 @@ static int __init simtempInit(void)
         if (IS_ERR(simtemp_pdev_fallback)) 
         {
             pr_info("INIT: No se pudo crear fallback, se cancela todo.\n");
-            ret = PTR_ERR(simtemp_pdev_fallback);
+            retVal = PTR_ERR(simtemp_pdev_fallback);
             platform_driver_unregister(&simtemp_platform_driver);
-            return ret;
+            return retVal;
         }
     } 
     else 
@@ -428,25 +516,27 @@ static int __init simtempInit(void)
     }
 
    timerInit();
+   sysfsInit();
    pr_info("INIT: simtemp: platform driver registered\n");
    return 0;
 }
 
+
+/******************* DEVICE EXIT OPERATION ************************/
+
 static void __exit simtempExit(void)
 {
-    timerDeInit();
-    if (simtemp_pdev_fallback && !IS_ERR(simtemp_pdev_fallback)) {
-        platform_device_unregister(simtemp_pdev_fallback);
-        simtemp_pdev_fallback = NULL;
-    }
-    platform_driver_unregister(&simtemp_platform_driver);
-    pr_info("EXIT: platform driver unregistered\n");
+   timerDeInit();
+   if (simtemp_pdev_fallback && !IS_ERR(simtemp_pdev_fallback)) {
+      platform_device_unregister(simtemp_pdev_fallback);
+      simtemp_pdev_fallback = NULL;
+   }
+   platform_driver_unregister(&simtemp_platform_driver);
+   pr_info("EXIT: platform driver unregistered\n");
 
-/*
-    misc_deregister(&simtempMiscDev);
-    pr_info("simtemp: Unloaded.\n");
 
-*/
+   misc_deregister(&simtempMiscDev);
+   pr_info("simtemp: Unloaded.\n");
 }
 
 module_init(simtempInit);
