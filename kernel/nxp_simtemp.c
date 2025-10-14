@@ -18,8 +18,13 @@
 /**********************************************************************/
 
 #define VERSION "b001"
-#define TMP_STUBBED_TEMPERATURE 14000
+#define SIMTEMP_THRESH_DEFAULT_mC 14000
 #define TMPR_SMPL_CIRC_BUFF_SIZE 20
+
+#define SIMTEMP_THRESH_MIN_mC   (-40000)
+#define SIMTEMP_THRESH_MAX_mC   (125000)
+
+
 #define TRUE  1
 #define FALSE 0
 #define u64 __u64
@@ -77,7 +82,7 @@ MODULE_DEVICE_TABLE(of, simtemp_of_match);
 /**********************************************************************/
 
 struct delayed_work readSampleTimer;
-s32 tmprBase = TMP_STUBBED_TEMPERATURE;
+s32 tmprBase = SIMTEMP_THRESH_DEFAULT_mC;
 struct simtempSample tmprSmplCircBuff[TMPR_SMPL_CIRC_BUFF_SIZE] = {0};   // Samples circular buffer
 spinlock_t tmprSmplBuffLock;                            // Spinlock to make exclusie areas 
                                                         // when producing and consuming last sample
@@ -107,6 +112,18 @@ static int simtempOpen(struct inode *ino, struct file *f);
 static int simtempRelease(struct inode *ino, struct file *f);
 static void simtempInitFromDT(struct simtempDev *sd);
 
+ssize_t samplingMsStore(struct device *dev,
+                               struct device_attribute *attr,
+                               const char *buf,
+                               size_t count);
+
+
+ssize_t samplingMsShow(struct device *dev,
+                              struct device_attribute *attr,
+                              char *buf);
+
+
+
 
 // Device operations table
 static const struct file_operations simtempFOps = {
@@ -129,15 +146,216 @@ static struct miscdevice simtempMiscDev = {
 /******************************* SYSFS *******************************/
 /*********************************************************************/
 
-ssize_t samplingMsStore(struct device *dev,
+static int globalParamThresholdMc = 45000;
+enum simtempMode
+{
+   SIMTEMP_MODE_NORMAL = 0,
+   SIMTEMP_MODE_NOISY,
+   SIMTEMP_MODE_RAMP
+};
+static enum simtempMode globalParamMode = SIMTEMP_MODE_NORMAL;
+
+/* Stats simples (RO) */
+struct simtempStats
+{
+   u64 produced;
+   u64 delivered;
+   u64 overruns;
+   u64 alerts;
+};
+static struct simtempStats globalStats;
+
+static ssize_t thresholdMcShow(struct device *dev,
                                struct device_attribute *attr,
-                               const char *buf,
-                               size_t count);
+                               char *buf)
+{
+   unsigned long flags;
+   int v;
+
+   spin_lock_irqsave(&sysfsLock, flags);
+   v = globalParamThresholdMc;
+   spin_unlock_irqrestore(&sysfsLock, flags);
+
+   return scnprintf(buf, PAGE_SIZE, "%d\n", v);
+}
+
+static ssize_t thresholdMcStore(struct device *dev,
+                                struct device_attribute *attr,
+                                const char *buf,
+                                size_t count)
+{
+   int val;
+   int oldVal;
+   int ret = kstrtoint(buf, 0, &val);
+   if (ret)
+      return ret;
+
+   if (val < SIMTEMP_THRESH_MIN_mC || val > SIMTEMP_THRESH_MAX_mC)
+      return -EINVAL;
+
+   spin_lock(&sysfsLock);
+   oldVal = globalParamThresholdMc;
+   globalParamThresholdMc = val;
+   spin_unlock(&sysfsLock);
+
+   pr_info("SYSFS: threshold_mC was updated from %d to %d\n", oldVal, globalParamThresholdMc);
+   return count;
+}
+
+/* Archivo sysfs: threshold_mC */
+static struct device_attribute thresholdMcAttr =
+   __ATTR(threshold_mC, 0664, thresholdMcShow, thresholdMcStore);
+
+
+static const char * modeToStr(enum simtempMode m)
+{
+   switch (m)
+   {
+      case SIMTEMP_MODE_NORMAL: return "normal";
+      case SIMTEMP_MODE_NOISY:  return "noisy";
+      case SIMTEMP_MODE_RAMP:   return "ramp";
+      default:                return "normal";
+   }
+}
+
+static int modeFromStr(const char *buf, enum simtempMode *out)
+{
+   if (sysfs_streq(buf, "normal")) { *out = SIMTEMP_MODE_NORMAL; return 0; }
+   if (sysfs_streq(buf, "noisy"))  { *out = SIMTEMP_MODE_NOISY;  return 0; }
+   if (sysfs_streq(buf, "ramp"))   { *out = SIMTEMP_MODE_RAMP;   return 0; }
+   return -EINVAL;
+}
+
+static ssize_t modeShow(struct device *dev,
+                        struct device_attribute *attr,
+                        char *buf)
+{
+   unsigned long flags;
+   enum simtempMode m;
+
+   spin_lock_irqsave(&sysfsLock, flags);
+   m = globalParamMode;
+   spin_unlock_irqrestore(&sysfsLock, flags);
+
+   return scnprintf(buf, PAGE_SIZE, "%s\n", modeToStr(m));
+}
+
+static ssize_t modeStore(struct device *dev,
+                         struct device_attribute *attr,
+                         const char *buf,
+                         size_t count)
+{
+   enum simtempMode m;
+   int ret = modeFromStr(buf, &m);
+   if (ret)
+      return ret;
+
+   spin_lock(&sysfsLock);
+   globalParamMode = m;
+   spin_unlock(&sysfsLock);
+
+   pr_info("SYSFS: mode set to %s\n", modeToStr(m));
+   return count;
+}
+
+/* Archivo sysfs: mode */
+static struct device_attribute modeAttr =
+   __ATTR(mode, 0664, modeShow, modeStore);
+
+
+static ssize_t statsShow(struct device *dev,
+                         struct device_attribute *attr,
+                         char *buf)
+{
+   unsigned long flags;
+   struct simtempStats s;
+
+   spin_lock_irqsave(&sysfsLock, flags);
+   s = globalStats;
+   spin_unlock_irqrestore(&sysfsLock, flags);
+
+   return scnprintf(buf, PAGE_SIZE,
+                    "produced=%llu\n"
+                    "delivered=%llu\n"
+                    "overruns=%llu\n"
+                    "alerts=%llu\n",
+                    s.produced, s.delivered, s.overruns, s.alerts);
+}
+
+/* Archivo sysfs: stats (RO) */
+static struct device_attribute statsAttr =
+   __ATTR(stats, 0444, statsShow, NULL);
+
+
+
+
 
 
 ssize_t samplingMsShow(struct device *dev,
                               struct device_attribute *attr,
-                              char *buf);
+                              char *buf)
+{
+
+   unsigned long flags;
+   u32 v;
+
+   spin_lock_irqsave(&sysfsLock, flags);
+   v = globalParam_SmplRate;
+   spin_unlock_irqrestore(&sysfsLock, flags);
+
+   return scnprintf(buf, PAGE_SIZE, "%u\n", v);
+
+}
+
+ssize_t samplingMsStore(struct device *dev,
+                               struct device_attribute *attr,
+                               const char *buf,
+                               size_t count)
+{
+   unsigned int val;
+   u32 oldVal;
+   int ret = kstrtouint(buf, 0, &val);
+   if (ret)
+      return ret;
+
+   // Validate limits
+   if (val < SIMTEMP_SAMPLING_MS_MIN || val > SIMTEMP_SAMPLING_MS_MAX)
+   {
+      return -EINVAL;
+   }
+      
+   oldVal = globalParam_SmplRate;
+   spin_lock(&sysfsLock);
+   globalParam_SmplRate = val;
+   spin_unlock(&sysfsLock);
+
+   pr_info("SYSFS: Sample rate was updated from %u to %u\n", oldVal, globalParam_SmplRate);
+
+   return count;
+}
+
+
+
+static struct device_attribute samplingMsAttr =
+   __ATTR(sampling_ms, 0664, samplingMsShow, samplingMsStore);
+
+
+
+
+/* Lista de atributos sysfs del driver */
+static struct attribute *simtempAttrs[] =
+{
+   &samplingMsAttr.attr,
+   &thresholdMcAttr.attr,
+   &modeAttr.attr,
+   &statsAttr.attr,
+   NULL,
+};
+
+static const struct attribute_group simtempAttrGroup =
+{
+   .attrs = simtempAttrs,
+};
 
 
 /*********************************************************************/
@@ -414,57 +632,6 @@ static int simtempRelease(struct inode *ino, struct file *f)
 /******************* DEVICE INIT OPERATION ************************/
 
 
-ssize_t samplingMsShow(struct device *dev,
-                              struct device_attribute *attr,
-                              char *buf)
-{
-
-   /*
-   unsigned long flags;
-   unsigned int v;
-
-   spin_lock_irqsave(&sd.lock, flags);
-   v = sd.samplingMs;
-   spin_unlock_irqrestore(&sd.lock, flags);
-
-   return scnprintf(buf, PAGE_SIZE, "%u\n", v);
-
-   */
-   return (ssize_t)0;
-}
-
-ssize_t samplingMsStore(struct device *dev,
-                               struct device_attribute *attr,
-                               const char *buf,
-                               size_t count)
-{
-   unsigned int val;
-   u32 oldVal;
-   int ret = kstrtouint(buf, 0, &val);
-   if (ret)
-      return ret;
-
-   // Validate limits
-   if (val < SIMTEMP_SAMPLING_MS_MIN || val > SIMTEMP_SAMPLING_MS_MAX)
-   {
-      return -EINVAL;
-   }
-      
-   oldVal = globalParam_SmplRate;
-   spin_lock(&sysfsLock);
-   globalParam_SmplRate = val;
-   spin_unlock(&sysfsLock);
-
-   pr_info("SYSFS: Sample rate was updated from %u to %u\n", oldVal, globalParam_SmplRate);
-
-   return count;
-}
-
-
-
-static struct device_attribute samplingMsAttr =
-   __ATTR(sampling_ms, 0664, samplingMsShow, samplingMsStore);
-
 
 static int __init simtempInit(void)
 {
@@ -476,16 +643,15 @@ static int __init simtempInit(void)
       return retVal;
    }
 
-   /* crear el atributo sysfs /sys/class/misc/simtemp/sampling_ms */
-   retVal = device_create_file(simtempMiscDev.this_device, &samplingMsAttr);
+
+   /* Cuelga el grupo completo en: /sys/class/misc/simtemp/ */
+   retVal = sysfs_create_group(&simtempMiscDev.this_device->kobj, &simtempAttrGroup);
    if (retVal)
    {
-      pr_err("simtemp: device_create_file(sampling_ms) failed (%d)\n", retVal);
+      pr_err("simtemp: sysfs_create_group() failed (%d)\n", retVal);
       misc_deregister(&simtempMiscDev);
       return retVal;
    }
-
-
 
    pr_info("INIT: Iniciando\n");
 
@@ -534,6 +700,11 @@ static void __exit simtempExit(void)
    platform_driver_unregister(&simtemp_platform_driver);
    pr_info("EXIT: platform driver unregistered\n");
 
+
+   if (simtempMiscDev.this_device)
+   {
+      sysfs_remove_group(&simtempMiscDev.this_device->kobj, &simtempAttrGroup);
+   }
 
    misc_deregister(&simtempMiscDev);
    pr_info("simtemp: Unloaded.\n");
