@@ -11,7 +11,9 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
-
+#include <linux/wait.h>
+#include <linux/poll.h>
+#include <linux/sched/signal.h>  /* TASK_INTERRUPTIBLE helpers */
 
 /**********************************************************************/
 /************************* MACRO DEFINITIONS **************************/
@@ -39,8 +41,10 @@
 #define SIMTEMP_SAMPLING_MS_DEFAULT  3000U
 #define SIMTEMP_SAMPLING_MS_MAX      60000U
 #define SIMTEMP_SAMPLING_MS_MIN      5U
-
 #define SIMTEMP_DEFAULT_THRESH_mC    45000
+
+#define GLOBAL_MODE_NONBLOCKING  0    // Global returning sample mode non blocking call
+#define GLOBAL_MODE_BLOCKING     1    // Global returning sampple mode blocking call
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jorge Sanchez");
@@ -100,6 +104,11 @@ u32 cbTail = 0;
 u32 globalParam_SmplRate = SIMTEMP_SAMPLING_MS_DEFAULT;
 int globalParam_tmprTreshold = SIMTEMP_DEFAULT_THRESH_mC;
 
+char globalMode = GLOBAL_MODE_NONBLOCKING;
+
+static DECLARE_WAIT_QUEUE_HEAD(simtempWait);
+
+// static bool thresholdEvent = FALSE;
 
 
 /*********************************************************************/
@@ -188,10 +197,15 @@ static ssize_t thresholdMcStore(struct device *dev,
    int oldVal;
    int ret = kstrtoint(buf, 0, &val);
    if (ret)
+   {
       return ret;
+   }
+      
 
    if (val < SIMTEMP_THRESH_MIN_mC || val > SIMTEMP_THRESH_MAX_mC)
+   {
       return -EINVAL;
+   }
 
    spin_lock(&sysfsLock);
    oldVal = globalParamThresholdMc;
@@ -496,7 +510,11 @@ static void readSampleTimerCallback(struct work_struct *work)
       cbTail = ((cbHead + 2) % TMPR_SMPL_CIRC_BUFF_SIZE);
    }
    cbHead = (cbHead + 1) % TMPR_SMPL_CIRC_BUFF_SIZE;
+   newSampleFlag = TRUE;
    spin_unlock(&tmprSmplBuffLock);
+
+   wake_up_interruptible(&simtempWait);
+
     
    if (lostSample != -1)
       pr_info("Se perdió la %i \n",lostSample);
@@ -562,18 +580,29 @@ static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t 
    char auxStr[OUTPUT_SIZE] = {0};
    unsigned long notCopied;
 
-
-
-   // struct simtempSample auxSample;
-
    spin_lock(&tmprSmplBuffLock);
    if (cbTail == cbHead)
    {
       spin_unlock(&tmprSmplBuffLock);
-      return 0;
+      if (f->f_flags & O_NONBLOCK)
+      {
+         return -EAGAIN;
+      }
+
+      int wret = wait_event_interruptible(simtempWait, cbTail != cbHead);
+      if (wret)   /* -ERESTARTSYS si recibe señal */
+      {
+         return wret;
+      }
+      /* Resume execution since there are new available sample(s) */
+      spin_lock(&tmprSmplBuffLock);
    }
    tmprLastSample = tmprSmplCircBuff[cbTail];
    cbTail = ((cbTail + 1) % TMPR_SMPL_CIRC_BUFF_SIZE);
+   if (cbTail == cbHead)
+   {
+      newSampleFlag = FALSE;
+   }
    spin_unlock(&tmprSmplBuffLock);
 
 
@@ -663,24 +692,23 @@ static int __init simtempInit(void)
    }
 
 
-    /* Fallback: crea un platform_device solo si NO hay DT poblado */
-    if (!of_have_populated_dt()) 
-    {
-        pr_info("INIT: no hay DT poblado → creando fallback platform_device\n");
-        simtemp_pdev_fallback = platform_device_register_simple("nxp_simtemp", PLATFORM_DEVID_AUTO, NULL, 0);
-        if (IS_ERR(simtemp_pdev_fallback)) 
-        {
-            pr_info("INIT: No se pudo crear fallback, se cancela todo.\n");
-            retVal = PTR_ERR(simtemp_pdev_fallback);
-            platform_driver_unregister(&simtemp_platform_driver);
-            return retVal;
-        }
-    } 
-    else 
-    {
-        pr_info("INIT: DT sí está poblado → NO se crea fallback\n");
-    }
-
+   /* Fallback: crea un platform_device solo si NO hay DT poblado */
+   if (!of_have_populated_dt()) 
+   {
+      pr_info("INIT: no hay DT poblado → creando fallback platform_device\n");
+      simtemp_pdev_fallback = platform_device_register_simple("nxp_simtemp", PLATFORM_DEVID_AUTO, NULL, 0);
+      if (IS_ERR(simtemp_pdev_fallback)) 
+      {
+         pr_info("INIT: No se pudo crear fallback, se cancela todo.\n");
+         retVal = PTR_ERR(simtemp_pdev_fallback);
+         platform_driver_unregister(&simtemp_platform_driver);
+         return retVal;
+      }
+   } 
+   else 
+   {
+      pr_info("INIT: DT sí está poblado → NO se crea fallback\n");
+   }
    timerInit();
    sysfsInit();
    pr_info("INIT: simtemp: platform driver registered\n");
