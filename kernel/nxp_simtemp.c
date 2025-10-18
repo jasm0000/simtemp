@@ -20,8 +20,7 @@
 /**********************************************************************/
 
 #define VERSION "b001"
-#define SIMTEMP_THRESH_DEFAULT_mC 14000
-#define TMPR_SMPL_CIRC_BUFF_SIZE 20
+#define TMPR_SMPL_CIRC_BUFF_SIZE     20
 
 #define SIMTEMP_THRESH_MIN_mC   (-40000)
 #define SIMTEMP_THRESH_MAX_mC   (125000)
@@ -32,6 +31,7 @@
 #define u64 __u64
 #define s32 __s32
 #define u32 __u32
+#define u16 __u16
 
 #define MASK_NEW_SMPL 1       // NEW SAMPLE FLAG MASK
 
@@ -41,10 +41,17 @@
 #define SIMTEMP_SAMPLING_MS_DEFAULT  3000U
 #define SIMTEMP_SAMPLING_MS_MAX      60000U
 #define SIMTEMP_SAMPLING_MS_MIN      5U
-#define SIMTEMP_DEFAULT_THRESH_mC    45000
+#define SIMTEMP_THRESH_DEFAULT    45000
 
 #define GLOBAL_MODE_NONBLOCKING  0    // Global returning sample mode non blocking call
 #define GLOBAL_MODE_BLOCKING     1    // Global returning sampple mode blocking call
+
+#define NOISE_RANGE_NORMAL 10
+#define NOISE_RANGE_NOISY  3000
+#define RAMP_RANGE         10000
+#define RAMP_STEP          10
+
+
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jorge Sanchez");
@@ -69,6 +76,7 @@ struct simtempDev     // DT input parameters type
    struct device       *dev;
    unsigned int         sampling_ms;
    int                  threshold_mC;
+   char                 mode;
 };
 
 static const struct of_device_id simtemp_of_match[] = 
@@ -86,7 +94,7 @@ MODULE_DEVICE_TABLE(of, simtemp_of_match);
 /**********************************************************************/
 
 struct delayed_work readSampleTimer;
-s32 tmprBase = SIMTEMP_THRESH_DEFAULT_mC;
+s32 tmprBase = SIMTEMP_THRESH_DEFAULT;
 struct simtempSample tmprSmplCircBuff[TMPR_SMPL_CIRC_BUFF_SIZE] = {0};   // Samples circular buffer
 spinlock_t tmprSmplBuffLock;                            // Spinlock to make exclusie areas 
                                                         // when producing and consuming last sample
@@ -102,13 +110,17 @@ u32 cbHead = 0;
 u32 cbTail = 0;
 
 u32 globalParam_SmplRate = SIMTEMP_SAMPLING_MS_DEFAULT;
-int globalParam_tmprTreshold = SIMTEMP_DEFAULT_THRESH_mC;
+int globalParam_tmprTreshold = SIMTEMP_THRESH_DEFAULT;
 
 char globalMode = GLOBAL_MODE_NONBLOCKING;
 
 static DECLARE_WAIT_QUEUE_HEAD(simtempWait);
 
 // static bool thresholdEvent = FALSE;
+
+u16 noiseRange = NOISE_RANGE_NORMAL;
+u16 rampSample;
+
 
 
 /*********************************************************************/
@@ -120,6 +132,7 @@ static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t 
 static int simtempOpen(struct inode *ino, struct file *f);
 static int simtempRelease(struct inode *ino, struct file *f);
 static void simtempInitFromDT(struct simtempDev *sd);
+static __poll_t simtempPoll(struct file *file, poll_table *wait);
 
 ssize_t samplingMsStore(struct device *dev,
                                struct device_attribute *attr,
@@ -130,17 +143,22 @@ ssize_t samplingMsStore(struct device *dev,
 ssize_t samplingMsShow(struct device *dev,
                               struct device_attribute *attr,
                               char *buf);
+void resetGlobalModeParams(void);
 
 
 
 
 // Device operations table
-static const struct file_operations simtempFOps = {
-    .owner   = THIS_MODULE,
-    .read    = simtempRead,
-    .open    = simtempOpen,
-    .release = simtempRelease,
+static const struct file_operations simtempFOps = 
+{
+   .owner   = THIS_MODULE,
+   .read    = simtempRead,
+   .open    = simtempOpen,
+   .release = simtempRelease,
+   .poll  = simtempPoll,
 };
+
+
 
 static struct miscdevice simtempMiscDev = {
     .minor = MISC_DYNAMIC_MINOR,
@@ -155,14 +173,16 @@ static struct miscdevice simtempMiscDev = {
 /******************************* SYSFS *******************************/
 /*********************************************************************/
 
-static int globalParamThresholdMc = 45000;
 enum simtempMode
 {
    SIMTEMP_MODE_NORMAL = 0,
    SIMTEMP_MODE_NOISY,
    SIMTEMP_MODE_RAMP
 };
-static enum simtempMode globalParamMode = SIMTEMP_MODE_NORMAL;
+
+
+static int globalParam_Threshold = 45000;
+static enum simtempMode globalParam_Mode = SIMTEMP_MODE_NORMAL;
 
 /* Stats simples (RO) */
 struct simtempStats
@@ -182,7 +202,7 @@ static ssize_t thresholdMcShow(struct device *dev,
    int v;
 
    spin_lock_irqsave(&sysfsLock, flags);
-   v = globalParamThresholdMc;
+   v = globalParam_Threshold;
    spin_unlock_irqrestore(&sysfsLock, flags);
 
    return scnprintf(buf, PAGE_SIZE, "%d\n", v);
@@ -208,11 +228,11 @@ static ssize_t thresholdMcStore(struct device *dev,
    }
 
    spin_lock(&sysfsLock);
-   oldVal = globalParamThresholdMc;
-   globalParamThresholdMc = val;
+   oldVal = globalParam_Threshold;
+   globalParam_Threshold = val;
    spin_unlock(&sysfsLock);
 
-   pr_info("SYSFS: threshold_mC was updated from %d to %d\n", oldVal, globalParamThresholdMc);
+   pr_info("SYSFS: threshold_mC was updated from %d to %d\n", oldVal, globalParam_Threshold);
    return count;
 }
 
@@ -248,7 +268,7 @@ static ssize_t modeShow(struct device *dev,
    enum simtempMode m;
 
    spin_lock_irqsave(&sysfsLock, flags);
-   m = globalParamMode;
+   m = globalParam_Mode;
    spin_unlock_irqrestore(&sysfsLock, flags);
 
    return scnprintf(buf, PAGE_SIZE, "%s\n", modeToStr(m));
@@ -265,7 +285,7 @@ static ssize_t modeStore(struct device *dev,
       return ret;
 
    spin_lock(&sysfsLock);
-   globalParamMode = m;
+   globalParam_Mode = m;
    spin_unlock(&sysfsLock);
 
    pr_info("SYSFS: mode set to %s\n", modeToStr(m));
@@ -385,7 +405,9 @@ static void simtemp_parse_dt(struct simtempDev *sd, struct device *dev)
 
    /* Defaults */
    sd->sampling_ms  = SIMTEMP_SAMPLING_MS_DEFAULT;
-   sd->threshold_mC = SIMTEMP_DEFAULT_THRESH_mC;
+   sd->threshold_mC = SIMTEMP_THRESH_DEFAULT;
+   sd->mode = SIMTEMP_MODE_NORMAL;
+   sd->mode = SIMTEMP_MODE_RAMP;
 
    if (!np)
    {
@@ -461,6 +483,7 @@ void simtempInitFromDT(struct simtempDev *sd)
 {
    globalParam_SmplRate = sd->sampling_ms;
    globalParam_tmprTreshold = sd->threshold_mC;
+   globalParam_Mode = sd->mode;
 }
 
 
@@ -528,6 +551,41 @@ static void readSampleTimerCallback(struct work_struct *work)
     
 }
 
+
+/*********************************************************************/
+/*********************************************************************/
+/****************************** POLL *********************************/
+/*********************************************************************/
+/*********************************************************************/
+
+
+static __poll_t simtempPoll(struct file *file, poll_table *wait)
+{
+   __poll_t mask = 0;
+
+   /* Registrar esta wait queue con el subsistema de poll/epoll */
+   poll_wait(file, &simtempWait, wait);
+
+   /* Reportar qué eventos están listos */
+   spin_lock(&tmprSmplBuffLock);
+
+   /* Datos listos para leer → POLLIN | POLLRDNORM */
+   if (cbTail != cbHead)
+      mask |= POLLIN | POLLRDNORM;
+
+   /* Umbral cruzado POLLPRI (out-of-band) */
+   /*
+   if (thresholdEvent)
+      mask |= POLLPRI;
+
+      */
+
+   spin_unlock(&tmprSmplBuffLock);
+
+   return mask;
+}
+
+
 /******************** TIMER INIT ********************************/
 
 static void timerInit(void)
@@ -535,6 +593,9 @@ static void timerInit(void)
    INIT_DELAYED_WORK(&readSampleTimer, readSampleTimerCallback);
    spin_lock_init(&tmprSmplBuffLock);
    timerReset();
+
+
+   rampSample = globalParam_Threshold - RAMP_RANGE;
 }
 
 static void sysfsInit(void)
@@ -555,12 +616,39 @@ static void timerDeInit(void)
 /*********************************************************************/
 /*********************************************************************/
 
+enum simtempMode auxMode;
+int auxThreshold;
+
 static s32 tmprSampleReadADC(void)
 {
-    // u32 r = prandom_u32() % 1001;
-    s32 r = get_random_u32() % 1001;
-    return tmprBase + r;
+   spin_lock(&sysfsLock);
+   auxMode = globalParam_Mode;
+   auxThreshold = globalParam_Threshold;
+   spin_unlock(&sysfsLock);
 
+   switch (auxMode)
+   {
+      case SIMTEMP_MODE_RAMP:
+         if (rampSample > auxThreshold + RAMP_RANGE)
+         {
+            rampSample = auxThreshold - RAMP_RANGE;
+         }
+         rampSample += RAMP_STEP;
+         return rampSample;
+      case SIMTEMP_MODE_NOISY:
+         return tmprBase + (get_random_u32() % (NOISE_RANGE_NOISY+1));
+      case SIMTEMP_MODE_NORMAL:
+      default:
+         return tmprBase + (get_random_u32() % (NOISE_RANGE_NORMAL+1));
+   }
+
+}
+
+
+void resetGlobalModeParams(void)
+{
+   noiseRange = NOISE_RANGE_NORMAL;
+   rampSample = globalParam_Threshold - RAMP_RANGE;
 }
 
 /*********************************************************************/
