@@ -20,6 +20,14 @@
 /**********************************************************************/
 
 #define VERSION "b001"
+
+#define SIMTEMP_NOISE_BASE 10000
+#define SIMTEMP_MODE_DEFAULT SIMTEMP_MODE_NOISY
+
+#define NOISE_RANGE_NORMAL 100
+#define NOISE_RANGE_NOISY  2000
+
+
 #define TMPR_SMPL_CIRC_BUFF_SIZE     20
 
 #define SIMTEMP_THRESH_MIN_mC   (-40000)
@@ -38,7 +46,7 @@
 
 // DT macros
 #define SIMTEMP_COMPATIBLE           "nxp,simtemp"
-#define SIMTEMP_SAMPLING_MS_DEFAULT  3000U
+#define SIMTEMP_SAMPLING_MS_DEFAULT  1000U
 #define SIMTEMP_SAMPLING_MS_MAX      60000U
 #define SIMTEMP_SAMPLING_MS_MIN      5U
 #define SIMTEMP_THRESH_DEFAULT    45000
@@ -46,10 +54,8 @@
 #define GLOBAL_MODE_NONBLOCKING  0    // Global returning sample mode non blocking call
 #define GLOBAL_MODE_BLOCKING     1    // Global returning sampple mode blocking call
 
-#define NOISE_RANGE_NORMAL 10
-#define NOISE_RANGE_NOISY  3000
 #define RAMP_RANGE         10000
-#define RAMP_STEP          10
+#define RAMP_STEP          100
 
 
 
@@ -93,8 +99,9 @@ MODULE_DEVICE_TABLE(of, simtemp_of_match);
 /************************ GLOBAL VARIABLES ****************************/
 /**********************************************************************/
 
+
 struct delayed_work readSampleTimer;
-s32 tmprBase = SIMTEMP_THRESH_DEFAULT;
+s32 tmprBase = SIMTEMP_NOISE_BASE;
 struct simtempSample tmprSmplCircBuff[TMPR_SMPL_CIRC_BUFF_SIZE] = {0};   // Samples circular buffer
 spinlock_t tmprSmplBuffLock;                            // Spinlock to make exclusie areas 
                                                         // when producing and consuming last sample
@@ -118,7 +125,6 @@ static DECLARE_WAIT_QUEUE_HEAD(simtempWait);
 
 // static bool thresholdEvent = FALSE;
 
-u16 noiseRange = NOISE_RANGE_NORMAL;
 u16 rampSample;
 
 
@@ -167,6 +173,7 @@ static struct miscdevice simtempMiscDev = {
     .mode  = 0666,     //  Read write permissions for everybody
 };
 
+int noiseRange = NOISE_RANGE_NORMAL/2;
 
 
 /*********************************************************************/
@@ -230,9 +237,14 @@ static ssize_t thresholdMcStore(struct device *dev,
    spin_lock(&sysfsLock);
    oldVal = globalParam_Threshold;
    globalParam_Threshold = val;
+   tmprBase = val +  noiseRange - (noiseRange / 10);
    spin_unlock(&sysfsLock);
 
    pr_info("SYSFS: threshold_mC was updated from %d to %d\n", oldVal, globalParam_Threshold);
+   pr_info("SYSFS: tmprBase: %d, noiseRange: %d, noiseRange / 10 = %d\n", 
+                   tmprBase, 
+                   noiseRange,
+                   noiseRange / 10);
    return count;
 }
 
@@ -284,11 +296,22 @@ static ssize_t modeStore(struct device *dev,
    if (ret)
       return ret;
 
+   pr_info("SYSFS: mode set to %s\n", modeToStr(m));
+
    spin_lock(&sysfsLock);
    globalParam_Mode = m;
+   if (SIMTEMP_MODE_NORMAL == globalParam_Mode)
+   {
+      noiseRange = NOISE_RANGE_NORMAL / 2;
+   }
+   if (SIMTEMP_MODE_NOISY == globalParam_Mode)
+   {
+      noiseRange = NOISE_RANGE_NOISY / 2;
+   }
    spin_unlock(&sysfsLock);
 
-   pr_info("SYSFS: mode set to %s\n", modeToStr(m));
+   pr_info("SYSFS: Noise range = %d\n", noiseRange);
+
    return count;
 }
 
@@ -406,8 +429,7 @@ static void simtemp_parse_dt(struct simtempDev *sd, struct device *dev)
    /* Defaults */
    sd->sampling_ms  = SIMTEMP_SAMPLING_MS_DEFAULT;
    sd->threshold_mC = SIMTEMP_THRESH_DEFAULT;
-   sd->mode = SIMTEMP_MODE_NORMAL;
-   sd->mode = SIMTEMP_MODE_RAMP;
+   sd->mode = SIMTEMP_MODE_DEFAULT;
 
    if (!np)
    {
@@ -490,6 +512,17 @@ void simtempInitFromDT(struct simtempDev *sd)
 
 /*********************************************************************/
 
+bool thresholdEvent;
+bool threshEventAux;
+bool notFirstSample = false;  // Control flag to aviod triggering a false threshold event in the first time a sample is generated
+s32 tmprPrevSample;
+s32 globalParam_ThresholdAux;
+
+
+#define FLAGS_NEW_SAMPLE      0x0001
+#define FLAGS_THRESHOLD_CROSS 0x0002
+
+
 
 /*********************************************************************/
 /********************  TIMER FUNCTIONS *******************************/
@@ -511,15 +544,34 @@ static void timerReset(void)
 
 /******************** TIMER CALL BACK ****************************/
 
+static inline bool detectThresholdCross(s32 prev, s32 curr, s32 threshold)
+{
+   return ((prev < threshold) != (curr < threshold));
+}
+
 static void readSampleTimerCallback(struct work_struct *work)
 {
    timerReset();
    tmprNewSample = tmprSampleReadADC();
    sampleNew.tempMC = tmprNewSample;
    sampleNew.timestampNS = ktime_get_ns();
-   sampleNew.flags = 1;
+   sampleNew.flags = FLAGS_NEW_SAMPLE;
    sampleNew.consecutive = simCnt;
    s32 lostSample = -1;
+   
+   spin_lock(&sysfsLock);
+   globalParam_ThresholdAux = globalParam_Threshold;
+   spin_unlock(&sysfsLock);
+
+
+   threshEventAux = notFirstSample & detectThresholdCross(tmprPrevSample, tmprNewSample, globalParam_ThresholdAux);
+   if (threshEventAux)
+   {
+      sampleNew.flags |= FLAGS_THRESHOLD_CROSS;
+   }
+   notFirstSample = true;
+   tmprPrevSample = tmprNewSample;
+
 
    pr_info("Timer ejecutado, muestra numero: %i = %i, at: %llu\n",simCnt++, tmprNewSample, sampleNew.timestampNS);
     
@@ -534,6 +586,7 @@ static void readSampleTimerCallback(struct work_struct *work)
    }
    cbHead = (cbHead + 1) % TMPR_SMPL_CIRC_BUFF_SIZE;
    newSampleFlag = TRUE;
+   thresholdEvent |= threshEventAux;
    spin_unlock(&tmprSmplBuffLock);
 
    wake_up_interruptible(&simtempWait);
@@ -554,64 +607,6 @@ static void readSampleTimerCallback(struct work_struct *work)
 
 /*********************************************************************/
 /*********************************************************************/
-/****************************** POLL *********************************/
-/*********************************************************************/
-/*********************************************************************/
-
-
-static __poll_t simtempPoll(struct file *file, poll_table *wait)
-{
-   __poll_t mask = 0;
-
-   /* Registrar esta wait queue con el subsistema de poll/epoll */
-   poll_wait(file, &simtempWait, wait);
-
-   /* Reportar qué eventos están listos */
-   spin_lock(&tmprSmplBuffLock);
-
-   /* Datos listos para leer → POLLIN | POLLRDNORM */
-   if (cbTail != cbHead)
-      mask |= POLLIN | POLLRDNORM;
-
-   /* Umbral cruzado POLLPRI (out-of-band) */
-   /*
-   if (thresholdEvent)
-      mask |= POLLPRI;
-
-      */
-
-   spin_unlock(&tmprSmplBuffLock);
-
-   return mask;
-}
-
-
-/******************** TIMER INIT ********************************/
-
-static void timerInit(void)
-{
-   INIT_DELAYED_WORK(&readSampleTimer, readSampleTimerCallback);
-   spin_lock_init(&tmprSmplBuffLock);
-   timerReset();
-
-
-   rampSample = globalParam_Threshold - RAMP_RANGE;
-}
-
-static void sysfsInit(void)
-{
-   spin_lock_init(&sysfsLock);
-}
-
-/******************* TIMER DE INIT ******************************/
-
-static void timerDeInit(void)
-{
-    cancel_delayed_work_sync(&readSampleTimer);
-}
-
-/*********************************************************************/
-/*********************************************************************/
 /*************** TEMPERATURE SAMPLES HANDLING ************************/
 /*********************************************************************/
 /*********************************************************************/
@@ -619,43 +614,43 @@ static void timerDeInit(void)
 enum simtempMode auxMode;
 int auxThreshold;
 
+
+static inline int randomSignedInt(int range)
+{
+   return ((int)(get_random_u32() % (2 * range + 1))) - range;
+}
+
+
+int noiseRangeAux;
+s32 tmprBaseAux;
+
+
 static s32 tmprSampleReadADC(void)
 {
    spin_lock(&sysfsLock);
    auxMode = globalParam_Mode;
    auxThreshold = globalParam_Threshold;
+   noiseRangeAux = noiseRange;
+   tmprBaseAux = tmprBase;
    spin_unlock(&sysfsLock);
 
    switch (auxMode)
    {
       case SIMTEMP_MODE_RAMP:
-         if (rampSample > auxThreshold + RAMP_RANGE)
+         if (rampSample > tmprBaseAux + RAMP_RANGE)
          {
-            rampSample = auxThreshold - RAMP_RANGE;
+            rampSample = tmprBaseAux - RAMP_RANGE;
          }
          rampSample += RAMP_STEP;
          return rampSample;
       case SIMTEMP_MODE_NOISY:
-         return tmprBase + (get_random_u32() % (NOISE_RANGE_NOISY+1));
       case SIMTEMP_MODE_NORMAL:
       default:
-         return tmprBase + (get_random_u32() % (NOISE_RANGE_NORMAL+1));
+         return tmprBase + randomSignedInt(noiseRangeAux);
    }
 
 }
 
-
-void resetGlobalModeParams(void)
-{
-   noiseRange = NOISE_RANGE_NORMAL;
-   rampSample = globalParam_Threshold - RAMP_RANGE;
-}
-
-/*********************************************************************/
-/*********************************************************************/
-/********************  KERNEL DEVICE SETUP ***************************/
-/*********************************************************************/
-/*********************************************************************/
 
 
 /******************* DEVICE READ OPERATION **********************/
@@ -663,7 +658,7 @@ void resetGlobalModeParams(void)
 
 static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t *off)
 {
-   #define OUTPUT_SIZE 40
+   #define OUTPUT_SIZE 60
    ssize_t retVal = OUTPUT_SIZE;
    char auxStr[OUTPUT_SIZE] = {0};
    unsigned long notCopied;
@@ -709,8 +704,16 @@ static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t 
    spin_unlock(&tmprSmplBuffLock);
 
    */
-    
-   snprintf(auxStr, sizeof(auxStr), "%i %d, at: %llu\n", tmprLastSample.consecutive, tmprLastSample.tempMC, tmprLastSample.timestampNS);
+
+   bool auxFlag1 = ((tmprLastSample.flags & FLAGS_NEW_SAMPLE) == FLAGS_NEW_SAMPLE);
+   bool auxFlag2 = ((tmprLastSample.flags & FLAGS_THRESHOLD_CROSS) == FLAGS_THRESHOLD_CROSS);
+
+   snprintf(auxStr, sizeof(auxStr), "%3d %5d, at: %llu, NF=%d, TF=%d\n", 
+            tmprLastSample.consecutive, 
+            tmprLastSample.tempMC, 
+            tmprLastSample.timestampNS,
+            auxFlag1,
+            auxFlag2);
    if (retVal != 0)
    {
       retVal = OUTPUT_SIZE;
@@ -728,6 +731,81 @@ static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t 
 
 
 }
+
+
+
+void resetGlobalModeParams(void)
+{
+   rampSample = tmprBase - RAMP_RANGE;
+}
+
+/*********************************************************************/
+/*********************************************************************/
+/****************************** POLL *********************************/
+/*********************************************************************/
+/*********************************************************************/
+
+
+static __poll_t simtempPoll(struct file *file, poll_table *wait)
+{
+   __poll_t mask = 0;
+
+   /* Registrar esta wait queue con el subsistema de poll/epoll */
+   poll_wait(file, &simtempWait, wait);
+
+   /* Reportar qué eventos están listos */
+   spin_lock(&tmprSmplBuffLock);
+
+   /* Datos listos para leer → POLLIN | POLLRDNORM */
+   if (cbTail != cbHead)
+      mask |= POLLIN | POLLRDNORM;
+
+   /* Umbral cruzado POLLPRI (out-of-band) */
+   
+   if (thresholdEvent)
+   {
+      mask |= POLLPRI;
+      thresholdEvent = false;
+   }
+   spin_unlock(&tmprSmplBuffLock);
+
+   return mask;
+}
+
+
+/******************** TIMER INIT ********************************/
+
+static void timerInit(void)
+{
+   INIT_DELAYED_WORK(&readSampleTimer, readSampleTimerCallback);
+   spin_lock_init(&tmprSmplBuffLock);
+   timerReset();
+
+
+   rampSample = globalParam_Threshold - RAMP_RANGE;
+}
+
+static void sysfsInit(void)
+{
+   spin_lock_init(&sysfsLock);
+}
+
+/******************* TIMER DE INIT ******************************/
+
+static void timerDeInit(void)
+{
+    cancel_delayed_work_sync(&readSampleTimer);
+}
+
+
+
+/*********************************************************************/
+/*********************************************************************/
+/********************  KERNEL DEVICE SETUP ***************************/
+/*********************************************************************/
+/*********************************************************************/
+
+
 
 /******************* DEVICE OPEN OPERATION ***************************/
 
