@@ -66,7 +66,10 @@ static bool readOnce(bool nonblock, int timeoutMs)
    // Using poll to wait for data from driver
    struct pollfd pfd;
    pfd.fd = fd;
-   pfd.events = POLLIN | POLLRDNORM | POLLPRI;
+   //pfd.events = POLLIN | POLLRDNORM | POLLPRI;
+   pfd.events = POLLPRI;
+
+
 
    int ret = poll(&pfd, 1, timeoutMs);
    if (ret < 0)
@@ -87,7 +90,7 @@ static bool readOnce(bool nonblock, int timeoutMs)
    ssize_t bytesRead = read(fd, buffer, sizeof(buffer) - 1);
    if (bytesRead < 0)
    {
-      cerr << "ERROR: read failed (" << strerror(errno) << ")\n";
+      cerr << "ERROR: read  failed (" << strerror(errno) << ")\n";
       close(fd);
       return false;
    }
@@ -126,7 +129,14 @@ int main(int argc, char** argv)
       else if (arg == "--once")
       {
          command = CMD_ONCE;
-
+      }
+      else if (arg == "--nonblock")
+      {
+         nonblock = true;
+      }
+      else if (arg == "--timeout" && i + 1 < argc)
+      {
+         timeoutMs = stoi(argv[++i]);
       }
       else
       {

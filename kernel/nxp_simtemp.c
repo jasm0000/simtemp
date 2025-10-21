@@ -21,15 +21,26 @@
 
 #define VERSION "b001"
 
-#define SIMTEMP_NOISE_BASE 10000
-#define SIMTEMP_MODE_DEFAULT SIMTEMP_MODE_NOISY
+
+
+#define SIMTEMP_MODE_DEFAULT         SIMTEMP_MODE_RAMP
+#define SIMTEMP_THRESH_DEFAULT       45000
+#define SIMTEMP_SAMPLING_MS_DEFAULT  1000U
 
 #define NOISE_RANGE_NORMAL 100
 #define NOISE_RANGE_NOISY  2000
 
+#define SIMTEMP_NOISE_BASE SIMTEMP_THRESH_DEFAULT
+
+
+#define SIMTEMP_MODE_NORMAL  0
+#define SIMTEMP_MODE_NOISY   1
+#define SIMTEMP_MODE_RAMP    2
+
+
+
 
 #define TMPR_SMPL_CIRC_BUFF_SIZE     20
-
 #define SIMTEMP_THRESH_MIN_mC   (-40000)
 #define SIMTEMP_THRESH_MAX_mC   (125000)
 
@@ -46,10 +57,8 @@
 
 // DT macros
 #define SIMTEMP_COMPATIBLE           "nxp,simtemp"
-#define SIMTEMP_SAMPLING_MS_DEFAULT  1000U
 #define SIMTEMP_SAMPLING_MS_MAX      60000U
 #define SIMTEMP_SAMPLING_MS_MIN      5U
-#define SIMTEMP_THRESH_DEFAULT    45000
 
 #define GLOBAL_MODE_NONBLOCKING  0    // Global returning sample mode non blocking call
 #define GLOBAL_MODE_BLOCKING     1    // Global returning sampple mode blocking call
@@ -173,33 +182,29 @@ static struct miscdevice simtempMiscDev = {
     .mode  = 0666,     //  Read write permissions for everybody
 };
 
-int noiseRange = NOISE_RANGE_NORMAL/2;
+int noiseRange;   
+/* noiseRange variable will always hold the half of the noise range 
+   value configured depending on the mode, noisy or normal */
 
 
+/*********************************************************************/
 /*********************************************************************/
 /******************************* SYSFS *******************************/
 /*********************************************************************/
-
-enum simtempMode
-{
-   SIMTEMP_MODE_NORMAL = 0,
-   SIMTEMP_MODE_NOISY,
-   SIMTEMP_MODE_RAMP
-};
-
+/*********************************************************************/
 
 static int globalParam_Threshold = 45000;
-static enum simtempMode globalParam_Mode = SIMTEMP_MODE_NORMAL;
+static char globalParam_Mode = SIMTEMP_MODE_NORMAL;
 
 /* Stats simples (RO) */
 struct simtempStats
 {
-   u64 produced;
-   u64 delivered;
-   u64 overruns;
-   u64 alerts;
+   u64 produced;     // Number of samples produced
+   u64 delivered;    // Number of samples consumed by user
+   u64 overruns;     // Number of times a sample was lost because of buffer full before reading last sample
+   u64 alerts;       // Number of times temperature threshold was crossed
 };
-static struct simtempStats globalStats;
+static struct simtempStats globalStats = {0};
 
 static ssize_t thresholdMcShow(struct device *dev,
                                struct device_attribute *attr,
@@ -214,6 +219,23 @@ static ssize_t thresholdMcShow(struct device *dev,
 
    return scnprintf(buf, PAGE_SIZE, "%d\n", v);
 }
+
+
+static inline void updateNoiseParams(void)
+{
+   if (SIMTEMP_MODE_NORMAL == globalParam_Mode)
+   {
+      noiseRange = NOISE_RANGE_NORMAL / 2;
+   }
+   if (SIMTEMP_MODE_NOISY == globalParam_Mode)
+   {
+      noiseRange = NOISE_RANGE_NOISY / 2;
+   }
+   tmprBase = globalParam_Threshold +  noiseRange - (noiseRange / 10);
+}
+
+
+
 
 static ssize_t thresholdMcStore(struct device *dev,
                                 struct device_attribute *attr,
@@ -237,7 +259,8 @@ static ssize_t thresholdMcStore(struct device *dev,
    spin_lock(&sysfsLock);
    oldVal = globalParam_Threshold;
    globalParam_Threshold = val;
-   tmprBase = val +  noiseRange - (noiseRange / 10);
+   updateNoiseParams();
+   // tmprBase = val +  noiseRange - (noiseRange / 10);
    spin_unlock(&sysfsLock);
 
    pr_info("SYSFS: threshold_mC was updated from %d to %d\n", oldVal, globalParam_Threshold);
@@ -253,7 +276,9 @@ static struct device_attribute thresholdMcAttr =
    __ATTR(threshold_mC, 0664, thresholdMcShow, thresholdMcStore);
 
 
-static const char * modeToStr(enum simtempMode m)
+
+
+static const char * modeToStr(char m)
 {
    switch (m)
    {
@@ -264,7 +289,7 @@ static const char * modeToStr(enum simtempMode m)
    }
 }
 
-static int modeFromStr(const char *buf, enum simtempMode *out)
+static int modeFromStr(const char *buf, char*out)
 {
    if (sysfs_streq(buf, "normal")) { *out = SIMTEMP_MODE_NORMAL; return 0; }
    if (sysfs_streq(buf, "noisy"))  { *out = SIMTEMP_MODE_NOISY;  return 0; }
@@ -277,7 +302,7 @@ static ssize_t modeShow(struct device *dev,
                         char *buf)
 {
    unsigned long flags;
-   enum simtempMode m;
+   char m;
 
    spin_lock_irqsave(&sysfsLock, flags);
    m = globalParam_Mode;
@@ -291,7 +316,7 @@ static ssize_t modeStore(struct device *dev,
                          const char *buf,
                          size_t count)
 {
-   enum simtempMode m;
+   char m;
    int ret = modeFromStr(buf, &m);
    if (ret)
       return ret;
@@ -300,6 +325,8 @@ static ssize_t modeStore(struct device *dev,
 
    spin_lock(&sysfsLock);
    globalParam_Mode = m;
+
+   /*
    if (SIMTEMP_MODE_NORMAL == globalParam_Mode)
    {
       noiseRange = NOISE_RANGE_NORMAL / 2;
@@ -308,6 +335,10 @@ static ssize_t modeStore(struct device *dev,
    {
       noiseRange = NOISE_RANGE_NOISY / 2;
    }
+   */
+
+   updateNoiseParams();
+
    spin_unlock(&sysfsLock);
 
    pr_info("SYSFS: Noise range = %d\n", noiseRange);
@@ -561,6 +592,7 @@ static void readSampleTimerCallback(struct work_struct *work)
    
    spin_lock(&sysfsLock);
    globalParam_ThresholdAux = globalParam_Threshold;
+   globalStats.produced++;                     // STATS: Increase amount of produced samples
    spin_unlock(&sysfsLock);
 
 
@@ -568,7 +600,10 @@ static void readSampleTimerCallback(struct work_struct *work)
    if (threshEventAux)
    {
       sampleNew.flags |= FLAGS_THRESHOLD_CROSS;
-   }
+      spin_lock(&sysfsLock);
+      globalStats.alerts++;                     // STATS: Increase amount of times threshold was crossed
+      spin_unlock(&sysfsLock);
+}
    notFirstSample = true;
    tmprPrevSample = tmprNewSample;
 
@@ -587,13 +622,20 @@ static void readSampleTimerCallback(struct work_struct *work)
    cbHead = (cbHead + 1) % TMPR_SMPL_CIRC_BUFF_SIZE;
    newSampleFlag = TRUE;
    thresholdEvent |= threshEventAux;
+   pr_info("TMR: thresholdEvent = %d\n",thresholdEvent);
    spin_unlock(&tmprSmplBuffLock);
 
    wake_up_interruptible(&simtempWait);
 
     
    if (lostSample != -1)
+   {
+      spin_lock(&sysfsLock);
+      globalStats.overruns++;                     // STATS: Increase amount of lost samples
+      spin_unlock(&sysfsLock);
       pr_info("Se perdió la %i \n",lostSample);
+
+   }
 
 
    /*
@@ -611,7 +653,7 @@ static void readSampleTimerCallback(struct work_struct *work)
 /*********************************************************************/
 /*********************************************************************/
 
-enum simtempMode auxMode;
+char auxMode;
 int auxThreshold;
 
 
@@ -664,29 +706,41 @@ static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t 
    unsigned long notCopied;
 
    spin_lock(&tmprSmplBuffLock);
-   if (cbTail == cbHead)
+   if (cbTail == cbHead)  // If no new samples availble to consume
    {
       spin_unlock(&tmprSmplBuffLock);
       if (f->f_flags & O_NONBLOCK)
-      {
+      {  // Return -EAGAIN if this call was a NONBLOCKING one
          return -EAGAIN;
       }
 
+      /* Waits until there is a new sample available */
       int wret = wait_event_interruptible(simtempWait, cbTail != cbHead);
-      if (wret)   /* -ERESTARTSYS si recibe señal */
-      {
+      if (wret)   /* Return -ERESTARTSYS if an interruption signal is received */
+      {           /* like Ctr-C, kill, etc*/
          return wret;
       }
       /* Resume execution since there are new available sample(s) */
       spin_lock(&tmprSmplBuffLock);
    }
    tmprLastSample = tmprSmplCircBuff[cbTail];
+   pr_info("READ: tmprLastSample.flags = %d\n", tmprLastSample.flags);
+   if ((tmprLastSample.flags & FLAGS_THRESHOLD_CROSS) == FLAGS_THRESHOLD_CROSS)
+   {
+      thresholdEvent = false;
+      pr_info("READ: thresholdEvent = 0\n");
+   }
+   
    cbTail = ((cbTail + 1) % TMPR_SMPL_CIRC_BUFF_SIZE);
    if (cbTail == cbHead)
    {
       newSampleFlag = FALSE;
    }
    spin_unlock(&tmprSmplBuffLock);
+   
+   spin_lock(&sysfsLock);
+   globalStats.delivered++;                     // STATS: Increase amount of consumed samples
+   spin_unlock(&sysfsLock);
 
 
    
@@ -750,7 +804,7 @@ static __poll_t simtempPoll(struct file *file, poll_table *wait)
 {
    __poll_t mask = 0;
 
-   /* Registrar esta wait queue con el subsistema de poll/epoll */
+   /* Register this wait queue whith poll */
    poll_wait(file, &simtempWait, wait);
 
    /* Reportar qué eventos están listos */
@@ -760,12 +814,13 @@ static __poll_t simtempPoll(struct file *file, poll_table *wait)
    if (cbTail != cbHead)
       mask |= POLLIN | POLLRDNORM;
 
-   /* Umbral cruzado POLLPRI (out-of-band) */
+   /* Crossing threshold POLLPRI  */
    
    if (thresholdEvent)
    {
+      pr_info("POLL: thresholdEvent = 1\n");
       mask |= POLLPRI;
-      thresholdEvent = false;
+      //thresholdEvent = false;
    }
    spin_unlock(&tmprSmplBuffLock);
 
@@ -780,9 +835,6 @@ static void timerInit(void)
    INIT_DELAYED_WORK(&readSampleTimer, readSampleTimerCallback);
    spin_lock_init(&tmprSmplBuffLock);
    timerReset();
-
-
-   rampSample = globalParam_Threshold - RAMP_RANGE;
 }
 
 static void sysfsInit(void)
@@ -877,7 +929,13 @@ static int __init simtempInit(void)
    }
    timerInit();
    sysfsInit();
+   updateNoiseParams();
+   rampSample = globalParam_Threshold - RAMP_RANGE;
    pr_info("INIT: simtemp: platform driver registered\n");
+   pr_info("INIT: globalParam_tmprTreshold = %d\n",globalParam_tmprTreshold);
+   pr_info("INIT: tmprBase                 = %d\n",tmprBase);
+   pr_info("INIT: noiseRange               = %d\n",noiseRange);
+
    return 0;
 }
 
@@ -886,6 +944,7 @@ static int __init simtempInit(void)
 
 static void __exit simtempExit(void)
 {
+   wake_up_interruptible_all(&simtempWait);
    timerDeInit();
    if (simtemp_pdev_fallback && !IS_ERR(simtemp_pdev_fallback)) {
       platform_device_unregister(simtemp_pdev_fallback);
