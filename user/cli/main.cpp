@@ -1,12 +1,12 @@
 // simtemp/user/cli/main.cpp
 #include <iostream>
 #include <string>
+#include <fstream>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
 #include <poll.h>
-#include <signal.h>
 
 using namespace std;
 
@@ -15,14 +15,15 @@ using namespace std;
 /****************************** GLOBAL CONSTANTS ****************************/
 /****************************************************************************/
 /****************************************************************************/
-
-static const char* devPath = "/dev/simtemp";
+static const char* devPath  = "/dev/simtemp";
+static const char* sysfsDir = "/sys/class/misc/simtemp";
 
 enum COMMAND_TYPE
 {
    CMD_NONE,
    CMD_ONCE,
-   CMD_FOLLOW
+   CMD_FOLLOW,
+   CMD_SET_SAMPLING
 };
 
 /****************************************************************************/
@@ -45,6 +46,48 @@ static void printHelp()
    cout << "Usage:\n";
    cout << "   ./simtempCli --once   [--nonblock] [--timeout MS]\n";
    cout << "   ./simtempCli --follow [--nonblock] [--timeout MS]\n";
+   cout << "   ./simtempCli --set-sampling MS\n";
+   cout << "\nNotes:\n";
+   cout << " - --set-sampling writes /sys/class/misc/simtemp/sampling_ms\n";
+   cout << " - You can combine --set-sampling with --once/--follow (set first, then read)\n";
+}
+
+/****************************************************************************/
+/******************************* SYSFS HELPERS ******************************/
+/****************************************************************************/
+
+// Write a simple text value into a sysfs file (e.g., sampling_ms)
+static bool writeTextFile(const string& path, const string& value)
+{
+   ofstream f(path);
+   if (!f.is_open())
+   {
+      cerr << "ERROR: could not open " << path << " for writing ("
+           << strerror(errno) << ")\n";
+      if (errno == EACCES)
+      {
+         std::cerr << "Hint: run with sudo, e.g.:\n"
+                  << "  sudo ./simtempCli --set-sampling " << value << "\n";
+      }
+      return false;
+   }
+
+
+   f << value << std::endl;
+
+   if (!f.good())
+   {
+      cerr << "ERROR: failed to write to " << path << "\n";
+      return false;
+   }
+   return true;
+}
+
+// Set sampling period in milliseconds via sysfs
+static bool setSamplingMs(unsigned ms)
+{
+   string path = string(sysfsDir) + "/sampling_ms";
+   return writeTextFile(path, to_string(ms));
 }
 
 /****************************************************************************/
@@ -161,7 +204,7 @@ static bool readFollow(bool nonblock)
          ssize_t bytesRead = read(fd, buffer, sizeof(buffer) - 1);
          if (bytesRead < 0)
          {
-            // For minimal version, treat EAGAIN as no data and continue
+            // treat EAGAIN as no data and continue
             if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
                continue;
@@ -177,11 +220,11 @@ static bool readFollow(bool nonblock)
             break;
          }
 
-         // Print raw text/binary chunk as-is (for the minimal phase)
+         // Print raw text
          cout.write(buffer, bytesRead);
          if (buffer[bytesRead - 1] != '\n')
          {
-            cout << "\n";
+            // cout << "\n";
          }
          cout.flush();
       }
@@ -198,11 +241,11 @@ static bool readFollow(bool nonblock)
 /****************************************************************************/
 /****************************************************************************/
 
-
 int main(int argc, char** argv)
 {
    int timeoutMs = -1;
    bool nonblock = false;
+   unsigned samplingMs = 0;
 
    enum COMMAND_TYPE command = CMD_NONE;
 
@@ -231,6 +274,11 @@ int main(int argc, char** argv)
       {
          timeoutMs = stoi(argv[++i]);
       }
+      else if (arg == "--set-sampling" && i + 1 < argc)
+      {
+         command = CMD_SET_SAMPLING;
+         samplingMs = static_cast<unsigned>(stoul(argv[++i]));
+      }
       else
       {
          cerr << "Unknown parameters: " << arg << endl;
@@ -239,6 +287,7 @@ int main(int argc, char** argv)
       }
    }
 
+   // Dispatch command
    switch (command)
    {
       case CMD_ONCE:
@@ -250,6 +299,12 @@ int main(int argc, char** argv)
 
       case CMD_FOLLOW:
          if (!readFollow(timeoutMs))
+         {
+            return 1;
+         }
+         return 0;
+      case CMD_SET_SAMPLING:
+         if (!setSamplingMs(samplingMs))
          {
             return 1;
          }
