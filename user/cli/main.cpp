@@ -25,7 +25,8 @@ enum COMMAND_TYPE
    CMD_FOLLOW,
    CMD_SET_SAMPLING,
    CMD_SET_MODE,
-   CMD_SET_THRESHOLD
+   CMD_SET_THRESHOLD,
+   CMD_SHOW_ALL
 };
 
 /****************************************************************************/
@@ -46,15 +47,17 @@ static void printHelp()
 {
    cout << "simtempCLI (hello)\n";
    cout << "Usage:\n";
-   cout << "   ./simtempCli --once   [--nonblock] [--timeout MS]\n";
-   cout << "   ./simtempCli --follow [--nonblock] [--timeout MS]\n";
+   cout << "   ./simtempCli --once              [--nonblock] [--timeout MS]\n";
+   cout << "   ./simtempCli --follow            [--nonblock] [--timeout MS]\n";
    cout << "   ./simtempCli --set-sampling MS\n";
    cout << "   ./simtempCli --set-mode {normal|noisy|ramp}\n";
    cout << "   ./simtempCli --set-threshold mC\n";
+   cout << "   ./simtempCli --show-all\n";
    cout << "\nNotes:\n";
    cout << " - --set-sampling writes /sys/class/misc/simtemp/sampling_ms\n";
    cout << " - --set-mode writes /sys/class/misc/simtemp/mode\n";
    cout << " - --set-threshold writes /sys/class/misc/simtemp/threshold_mC\n";
+   cout << " - --show-all reads sampling_ms, mode, threshold_mC and stats\n";
    cout << " - You can combine --set-xxx with --once/--follow (set first, then read)\n";
 }
 
@@ -115,6 +118,85 @@ static bool setThresholdmC(int mC)
    string path = string(sysfsDir) + "/threshold_mC";
    return writeTextFile(path, to_string(mC));
 }
+
+static bool readTextFile(const string& path, string& out)
+{
+   ifstream f(path);
+   if (!f.is_open())
+   {
+      cerr << "ERROR: could not open " << path << " for reading ("
+           << strerror(errno) << ")\n";
+      return false;
+   }
+
+   string line;
+   out.clear();
+   while (std::getline(f, line))
+   {
+      out += line;
+      out.push_back('\n');
+   }
+
+   if (!f.good() && !f.eof())
+   {
+      cerr << "ERROR: failed to read from " << path << "\n";
+      return false;
+   }
+
+   return true;
+}
+
+static bool showAll()
+{
+   bool ok = true;
+   string v;
+
+   cout << "---- simtemp sysfs ----\n";
+
+   v.clear();
+   if (readTextFile(string(sysfsDir) + "/sampling_ms", v))
+   {
+      cout << "sampling_ms:\n   " << v;
+   }
+   else
+   {
+      ok = false;
+   }
+
+   v.clear();
+   if (readTextFile(string(sysfsDir) + "/mode", v))
+   {
+      cout << "mode:\n   " << v;
+   }
+   else
+   {
+      ok = false;
+   }
+
+   v.clear();
+   if (readTextFile(string(sysfsDir) + "/threshold_mC", v))
+   {
+      cout << "threshold_mC:\n   " << v;
+   }
+   else
+   {
+      ok = false;
+   }
+
+   v.clear();
+   if (readTextFile(string(sysfsDir) + "/stats", v))
+   {
+      cout << "stats:\n" << v;
+   }
+   else
+   {
+      ok = false;
+   }
+
+   cout.flush();
+   return ok;
+}
+
 
 /****************************************************************************/
 /****************************************************************************/
@@ -317,6 +399,10 @@ int main(int argc, char** argv)
          command = CMD_SET_THRESHOLD;
          thresholdmC = stoi(argv[++i]);
       }
+      else if (arg == "--show-all")
+      {
+         command = CMD_SHOW_ALL;
+      }
       else
       {
          cerr << "Unknown parameters: " << arg << endl;
@@ -362,6 +448,14 @@ int main(int argc, char** argv)
             return 1;
          }
          return 0;
+      case CMD_SHOW_ALL:
+         {
+            if (!showAll())
+            {
+               return 1;
+            }
+            return 0;
+         }
 
       case CMD_NONE:
          break;

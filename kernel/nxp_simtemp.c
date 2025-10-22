@@ -363,10 +363,10 @@ static ssize_t statsShow(struct device *dev,
    spin_unlock_irqrestore(&sysfsLock, flags);
 
    return scnprintf(buf, PAGE_SIZE,
-                    "produced=%llu\n"
-                    "delivered=%llu\n"
-                    "overruns=%llu\n"
-                    "alerts=%llu\n",
+                    "   produced  = %llu\n"
+                    "   delivered = %llu\n"
+                    "   overruns  = %llu\n"
+                    "   alerts    = %llu\n",
                     s.produced, s.delivered, s.overruns, s.alerts);
 }
 
