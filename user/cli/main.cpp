@@ -23,7 +23,9 @@ enum COMMAND_TYPE
    CMD_NONE,
    CMD_ONCE,
    CMD_FOLLOW,
-   CMD_SET_SAMPLING
+   CMD_SET_SAMPLING,
+   CMD_SET_MODE,
+   CMD_SET_THRESHOLD
 };
 
 /****************************************************************************/
@@ -47,9 +49,13 @@ static void printHelp()
    cout << "   ./simtempCli --once   [--nonblock] [--timeout MS]\n";
    cout << "   ./simtempCli --follow [--nonblock] [--timeout MS]\n";
    cout << "   ./simtempCli --set-sampling MS\n";
+   cout << "   ./simtempCli --set-mode {normal|noisy|ramp}\n";
+   cout << "   ./simtempCli --set-threshold mC\n";
    cout << "\nNotes:\n";
    cout << " - --set-sampling writes /sys/class/misc/simtemp/sampling_ms\n";
-   cout << " - You can combine --set-sampling with --once/--follow (set first, then read)\n";
+   cout << " - --set-mode writes /sys/class/misc/simtemp/mode\n";
+   cout << " - --set-threshold writes /sys/class/misc/simtemp/threshold_mC\n";
+   cout << " - You can combine --set-xxx with --once/--follow (set first, then read)\n";
 }
 
 /****************************************************************************/
@@ -88,6 +94,26 @@ static bool setSamplingMs(unsigned ms)
 {
    string path = string(sysfsDir) + "/sampling_ms";
    return writeTextFile(path, to_string(ms));
+}
+
+// Set operating mode via sysfs (expects: normal|noisy|ramp)
+static bool setMode(const string& mode)
+{
+   if (mode != "normal" && mode != "noisy" && mode != "ramp")
+   {
+      cerr << "ERROR: invalid mode: " << mode << " (use normal|noisy|ramp)\n";
+      return false;
+   }
+
+   string path = string(sysfsDir) + "/mode";
+   return writeTextFile(path, mode);
+}
+
+// Set threshold in milli-degrees Celsius via sysfs (e.g., 45000 = 45.000 C)
+static bool setThresholdmC(int mC)
+{
+   string path = string(sysfsDir) + "/threshold_mC";
+   return writeTextFile(path, to_string(mC));
 }
 
 /****************************************************************************/
@@ -246,6 +272,8 @@ int main(int argc, char** argv)
    int timeoutMs = -1;
    bool nonblock = false;
    unsigned samplingMs = 0;
+   string mode;
+   int thresholdmC = 0;
 
    enum COMMAND_TYPE command = CMD_NONE;
 
@@ -279,6 +307,16 @@ int main(int argc, char** argv)
          command = CMD_SET_SAMPLING;
          samplingMs = static_cast<unsigned>(stoul(argv[++i]));
       }
+      else if (arg == "--set-mode" && i + 1 < argc)
+      {
+         command = CMD_SET_MODE;
+         mode = argv[++i];
+      }
+      else if (arg == "--set-threshold" && i + 1 < argc)
+      {
+         command = CMD_SET_THRESHOLD;
+         thresholdmC = stoi(argv[++i]);
+      }
       else
       {
          cerr << "Unknown parameters: " << arg << endl;
@@ -303,8 +341,23 @@ int main(int argc, char** argv)
             return 1;
          }
          return 0;
+
       case CMD_SET_SAMPLING:
          if (!setSamplingMs(samplingMs))
+         {
+            return 1;
+         }
+         return 0;
+
+      case CMD_SET_MODE:
+         if (!setMode(mode))
+         {
+            return 1;
+         }
+         return 0;
+
+      case CMD_SET_THRESHOLD:
+         if (!setThresholdmC(thresholdmC))
          {
             return 1;
          }
