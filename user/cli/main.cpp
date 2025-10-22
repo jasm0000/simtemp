@@ -48,7 +48,7 @@ static void printHelp()
    cout << "simtempCLI (hello)\n";
    cout << "Usage:\n";
    cout << "   ./simtempCli --once              [--nonblock] [--timeout MS]\n";
-   cout << "   ./simtempCli --follow            [--nonblock] [--timeout MS]\n";
+   cout << "   ./simtempCli --follow            [--nonblock] [--timeout MS] [--reopen]\n";
    cout << "   ./simtempCli --set-sampling MS\n";
    cout << "   ./simtempCli --set-mode {normal|noisy|ramp}\n";
    cout << "   ./simtempCli --set-threshold mC\n";
@@ -58,6 +58,8 @@ static void printHelp()
    cout << " - --set-mode writes /sys/class/misc/simtemp/mode\n";
    cout << " - --set-threshold writes /sys/class/misc/simtemp/threshold_mC\n";
    cout << " - --show-all reads sampling_ms, mode, threshold_mC and stats\n";
+   cout << " - --timeout applies to --once and --follow; use -1 for infinite wait\n";
+   cout << " - --reopen  performs reopen at eof, in cat command style\n";
    cout << " - You can combine --set-xxx with --once/--follow (set first, then read)\n";
 }
 
@@ -197,7 +199,6 @@ static bool showAll()
    return ok;
 }
 
-
 /****************************************************************************/
 /****************************************************************************/
 /********************************* ONCE *************************************/
@@ -265,9 +266,11 @@ static bool readOnce(bool nonblock, int timeoutMs)
 /****************************************************************************/
 /****************************************************************************/
 
-// Continuously reads from /dev/simtemp using poll()
-// - Reads and prints what arrives.
-static bool readFollow(bool nonblock)
+// Follow mode:
+// - Supports timeout (--timeout).
+// - Differentiates POLLIN/POLLRDNORM (data) vs POLLPRI (alert).
+// - Supports reopen in cat command style.
+static bool readFollow(bool nonblock, int timeoutMs, bool reopenOnEof)
 {
    int flags = O_RDONLY;
    if (nonblock)
@@ -288,16 +291,24 @@ static bool readFollow(bool nonblock)
 
    for (;;)
    {
-      // Wait indefinitely for any readable event
-      int ret = poll(&pfd, 1, -1);
+      int ret = poll(&pfd, 1, timeoutMs);
       if (ret < 0)
       {
+         if (errno == EINTR)
+         {
+            continue;
+         }
          cerr << "ERROR: poll failed (" << strerror(errno) << ")\n";
          close(fd);
          return false;
       }
 
-      // If device signaled error/hangup, exit
+      if (ret == 0)
+      {
+         cerr << "TIMEOUT: no data received in " << timeoutMs << " ms\n";
+         break;
+      }
+
       if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
       {
          cerr << "Device not readable anymore (revents=0x"
@@ -306,25 +317,67 @@ static bool readFollow(bool nonblock)
       }
 
       // Data available: read and print
-      if (pfd.revents & (POLLIN | POLLRDNORM | POLLPRI))
+      if ((pfd.revents & POLLPRI) != 0)
       {
          char buffer[256] = {0};
          ssize_t bytesRead = read(fd, buffer, sizeof(buffer) - 1);
          if (bytesRead < 0)
          {
-            // treat EAGAIN as no data and continue
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { continue; }
+            cerr << "ERROR: read (POLLPRI) failed (" << strerror(errno) << ")\n";
+            close(fd);
+            return false;
+         }
+         if (bytesRead == 0)
+         {
+            cerr << "EOF after POLLPRI\n";
+            if (reopenOnEof)
             {
+               close(fd);
+               fd = open(devPath, flags);
+               if (fd < 0)
+               {
+                  cerr << "ERROR: reopen failed (" << strerror(errno) << ")\n";
+                  return false;
+               }
+               pfd.fd = fd;
                continue;
             }
+            break;
+         }
+
+         cerr << "[ALERT] poll: POLLPRI\n";
+         cout.write(buffer, bytesRead);
+         cout.flush();
+         continue;
+      }
+
+      if ((pfd.revents & POLLIN) != 0 || (pfd.revents & POLLRDNORM) != 0)
+      {
+         char buffer[256] = {0};
+         ssize_t bytesRead = read(fd, buffer, sizeof(buffer) - 1);
+         if (bytesRead < 0)
+         {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { continue; }
             cerr << "ERROR: read failed (" << strerror(errno) << ")\n";
             close(fd);
             return false;
          }
          if (bytesRead == 0)
          {
-            // EOF from driver: exit follow
-            cerr << "EOF from device — exiting follow\n";
+            cerr << "EOF from device\n";
+            if (reopenOnEof)
+            {
+               close(fd);
+               fd = open(devPath, flags);
+               if (fd < 0)
+               {
+                  cerr << "ERROR: reopen failed (" << strerror(errno) << ")\n";
+                  return false;
+               }
+               pfd.fd = fd;
+               continue;
+            }
             break;
          }
 
@@ -351,10 +404,11 @@ static bool readFollow(bool nonblock)
 
 int main(int argc, char** argv)
 {
-   int timeoutMs = -1;
-   bool nonblock = false;
+   int timeoutMs    = -1;
+   bool nonblock    = false;
+   bool reopenOnEof = false;
    unsigned samplingMs = 0;
-   string mode;
+   string mode;   
    int thresholdmC = 0;
 
    enum COMMAND_TYPE command = CMD_NONE;
@@ -383,6 +437,10 @@ int main(int argc, char** argv)
       else if (arg == "--timeout" && i + 1 < argc)
       {
          timeoutMs = stoi(argv[++i]);
+      }
+      else if (arg == "--reopen")
+      {
+         reopenOnEof = true;
       }
       else if (arg == "--set-sampling" && i + 1 < argc)
       {
@@ -416,46 +474,33 @@ int main(int argc, char** argv)
    {
       case CMD_ONCE:
          if (!readOnce(nonblock, timeoutMs))
-         {
             return 1;
-         }
          return 0;
 
       case CMD_FOLLOW:
-         if (!readFollow(timeoutMs))
-         {
+         if (!readFollow(nonblock, timeoutMs, reopenOnEof))
             return 1;
-         }
          return 0;
 
       case CMD_SET_SAMPLING:
          if (!setSamplingMs(samplingMs))
-         {
             return 1;
-         }
          return 0;
 
       case CMD_SET_MODE:
          if (!setMode(mode))
-         {
             return 1;
-         }
          return 0;
 
       case CMD_SET_THRESHOLD:
          if (!setThresholdmC(thresholdmC))
-         {
             return 1;
-         }
          return 0;
+
       case CMD_SHOW_ALL:
-         {
-            if (!showAll())
-            {
-               return 1;
-            }
-            return 0;
-         }
+         if (!showAll())
+            return 1;
+         return 0;
 
       case CMD_NONE:
          break;
