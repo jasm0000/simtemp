@@ -7,6 +7,8 @@
 #include <cerrno>
 #include <cstring>
 #include <poll.h>
+#include <stdint.h>
+#include <algorithm>
 
 using namespace std;
 
@@ -199,6 +201,145 @@ static bool showAll()
    return ok;
 }
 
+
+/****************************************************************************/
+/********************** 16-BYTE BINARY SAMPLE RECORD READ *******************/
+/****************************************************************************/
+
+struct __attribute__((packed)) SimtempRecord16
+{
+   uint64_t timestamp_ns;  /* monotonic ns */
+   int32_t  temp_mC;       /* milli °C */
+   uint32_t flags;         /* bit0=NEW_SAMPLE, bit1=THRESHOLD */
+};
+
+/* Make human-readable output from a decoded 16B record. */
+static void printSampleHuman(const SimtempRecord16& r)
+{
+   double t_ms = static_cast<double>(r.timestamp_ns) / 1e6;
+   double t_C  = static_cast<double>(r.temp_mC) / 1000.0;
+   unsigned alert = (r.flags & (1u << 1)) ? 1u : 0u;
+   cout << "t_ms=" << t_ms << " temp=" << t_C << "C alert=" << alert << "\n";
+}
+
+/* enum to report how a read attempt finished. */
+enum READ_RESULT
+{
+   RR_OK = 0,   /* printed something successfully (binary or ASCII) */
+   RR_EOF,      /* got EOF while trying to read */
+   RR_ERR       /* fatal read error */
+};
+
+/* 
+ * Try to accumulate exactly 16 bytes and decode the binary record.
+ * - If exactly 16 bytes collected: decode and print one line: RR_OK
+ * - If less than 16 (short read, driver still ASCII, etc) then
+ *     fall back to printing as text using a small buffer: RR_OK (unless 0 and EOF)
+ * - If we see n == 0 before collecting anything: RR_EOF.
+ * - If we hit a fatal error: RR_ERR.
+ * This helper does NOT call poll(), caller guarantees readiness
+ */
+static enum READ_RESULT readBinaryOrTextOnce(int fd)
+{
+   alignas(SimtempRecord16) unsigned char recBuf[sizeof(SimtempRecord16)] = {};
+   // static_assert(sizeof(SimtempRecord16) == 16, "SimtempRecord16 must be 16 bytes");
+
+   size_t have = 0;
+
+   while (have < sizeof(recBuf))
+   {
+      ssize_t n = ::read(fd, recBuf + have, sizeof(recBuf) - have);
+      if (n < 0)
+      {
+         if (errno == EINTR)
+         {
+            continue; /* interrupted by signal, just retry */
+         }
+         if (errno == EAGAIN || errno == EWOULDBLOCK)
+         {
+            /* no more data now; stop trying to complete the record */
+            break;
+         }
+         cerr << "ERROR: read failed (" << strerror(errno) << ")\n";
+         return RR_ERR;
+      }
+      if (n == 0)
+      {
+         /* EOF while accumulating; if we had 0 so far, treat as EOF */
+         if (have == 0)
+         {
+            return RR_EOF;
+         }
+         /* if we had some bytes, treat as incomplete and fall back to text below */
+         break;
+      }
+      have += static_cast<size_t>(n);
+   }
+
+   if (have == sizeof(recBuf))
+   {
+      SimtempRecord16 rec{};
+      // memcpy(&rec, recBuf, sizeof(rec));
+      std::copy_n(recBuf, sizeof(recBuf), reinterpret_cast<unsigned char*>(&rec));
+
+
+      cout << "Read from driver (16 bytes):\n";
+      printSampleHuman(rec);
+      cout.flush();
+      return RR_OK;
+   }
+
+   /* Fallback to text: print whatever we have as raw text (plus try to extend it) */
+   {
+      char buf[256] = {0};
+      size_t used = 0;
+
+      if (have > 0)
+      {
+         size_t copy = have;
+         if (copy > sizeof(buf) - 1) copy = sizeof(buf) - 1;
+         //memcpy(buf, recBuf, copy);
+         std::copy_n(recBuf, copy, buf); 
+         used = copy;
+      }
+
+      if (used < sizeof(buf) - 1)
+      {
+         ssize_t m = ::read(fd, buf + used, (sizeof(buf) - 1) - used);
+         if (m > 0)
+         {
+            used += static_cast<size_t>(m);
+         }
+         else if (m == 0 && used == 0)
+         {
+            /* real EOF and nothing to print */
+            return RR_EOF;
+         }
+         else if (m < 0)
+         {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            {
+               cerr << "ERROR: read (fallback) failed (" << strerror(errno) << ")\n";
+               return RR_ERR;
+            }
+         }
+      }
+
+      if (used > 0)
+      {
+         cout << "Read from driver (" << used << " bytes):\n";
+         cout.write(buf, used);
+         if (buf[used - 1] != '\n')
+         {
+            cout << "\n";
+         }
+         cout.flush();
+      }
+      /* nothing printable */
+      return RR_OK;
+   }
+}
+
 /****************************************************************************/
 /****************************************************************************/
 /********************************* ONCE *************************************/
@@ -243,18 +384,19 @@ static bool readOnce(bool nonblock, int timeoutMs)
       return false;
    }
 
-   // Reading what driver has to return
-   char buffer[128] = {0};
-   ssize_t bytesRead = read(fd, buffer, sizeof(buffer) - 1);
-   if (bytesRead < 0)
+   /* perform a single binary-or-text read */
+   enum READ_RESULT rr = readBinaryOrTextOnce(fd);
+   if (rr == RR_ERR)
    {
-      cerr << "ERROR: read failed (" << strerror(errno) << ")\n";
       close(fd);
       return false;
    }
-
-   cout << "Read from driver (" << bytesRead << " bytes):\n";
-   cout << buffer << endl;
+   if (rr == RR_EOF)
+   {
+      cerr << "EOF from device\n";
+      close(fd);
+      return false;
+   }
 
    close(fd);
    return true;
@@ -316,19 +458,16 @@ static bool readFollow(bool nonblock, int timeoutMs, bool reopenOnEof)
          break;
       }
 
-      // Data available: read and print
+      // Data available: read and print (binary 16B or fallback to text)
       if ((pfd.revents & POLLPRI) != 0)
       {
-         char buffer[256] = {0};
-         ssize_t bytesRead = read(fd, buffer, sizeof(buffer) - 1);
-         if (bytesRead < 0)
+         enum READ_RESULT rr = readBinaryOrTextOnce(fd);
+         if (rr == RR_ERR)
          {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) { continue; }
-            cerr << "ERROR: read (POLLPRI) failed (" << strerror(errno) << ")\n";
             close(fd);
             return false;
          }
-         if (bytesRead == 0)
+         if (rr == RR_EOF)
          {
             cerr << "EOF after POLLPRI\n";
             if (reopenOnEof)
@@ -345,25 +484,18 @@ static bool readFollow(bool nonblock, int timeoutMs, bool reopenOnEof)
             }
             break;
          }
-
-         cerr << "[ALERT] poll: POLLPRI\n";
-         cout.write(buffer, bytesRead);
-         cout.flush();
          continue;
       }
 
       if ((pfd.revents & POLLIN) != 0 || (pfd.revents & POLLRDNORM) != 0)
       {
-         char buffer[256] = {0};
-         ssize_t bytesRead = read(fd, buffer, sizeof(buffer) - 1);
-         if (bytesRead < 0)
+         enum READ_RESULT rr = readBinaryOrTextOnce(fd);
+         if (rr == RR_ERR)
          {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) { continue; }
-            cerr << "ERROR: read failed (" << strerror(errno) << ")\n";
             close(fd);
             return false;
          }
-         if (bytesRead == 0)
+         if (rr == RR_EOF)
          {
             cerr << "EOF from device\n";
             if (reopenOnEof)
@@ -380,14 +512,6 @@ static bool readFollow(bool nonblock, int timeoutMs, bool reopenOnEof)
             }
             break;
          }
-
-         // Print raw text
-         cout.write(buffer, bytesRead);
-         if (buffer[bytesRead - 1] != '\n')
-         {
-            // cout << "\n";
-         }
-         cout.flush();
       }
    }
 

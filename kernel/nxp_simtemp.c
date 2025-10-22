@@ -13,7 +13,8 @@
 #include <linux/platform_device.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
-#include <linux/sched/signal.h>  /* TASK_INTERRUPTIBLE helpers */
+#include <linux/sched/signal.h>
+#include <linux/slab.h>
 
 /**********************************************************************/
 /************************* MACRO DEFINITIONS **************************/
@@ -66,6 +67,9 @@
 #define RAMP_RANGE         10000
 #define RAMP_STEP          100
 
+#define FLAGS_NEW_SAMPLE      0x0001
+#define FLAGS_THRESHOLD_CROSS 0x0002
+
 
 
 MODULE_LICENSE("GPL");
@@ -77,6 +81,22 @@ MODULE_VERSION(VERSION);
 /*********************************************************************/
 /*********************  TYPE DEFINITIONS *****************************/
 /*********************************************************************/
+
+struct simtempRecord16
+{
+   u64 timestamp_ns;   /* monotonic ns */
+   s32 temp_mC;        /* milli °C */
+   u32 flags;          /* bit0=NEW_SAMPLE, bit1=THRESHOLD */
+} __attribute__((packed));
+
+// per-file descriptor context to support short reads safely.
+// It stores a frozen 16B record and the copy offset across read() calls.
+struct simtempFctx
+{
+   struct simtempRecord16 out;
+   size_t outOff;      /* how many bytes have been returned so far */
+   bool   outValid;    /* there is a record pending completion */
+};
 
 struct simtempSample 
 {
@@ -135,6 +155,17 @@ static DECLARE_WAIT_QUEUE_HEAD(simtempWait);
 // static bool thresholdEvent = FALSE;
 
 u16 rampSample;
+
+
+bool thresholdEvent;
+bool threshEventAux;
+bool notFirstSample = false;  // Control flag to aviod triggering a false threshold event in the first time a sample is generated
+s32 tmprPrevSample;
+s32 globalParam_ThresholdAux;
+char auxMode;
+int auxThreshold;
+int noiseRangeAux;
+s32 tmprBaseAux;
 
 
 
@@ -221,7 +252,7 @@ static ssize_t thresholdMcShow(struct device *dev,
 }
 
 
-static inline void updateNoiseParams(void)
+static inline void updateNoiseParams(void)   // Declared inline for efficiency purposes in the critical time calls
 {
    if (SIMTEMP_MODE_NORMAL == globalParam_Mode)
    {
@@ -274,6 +305,7 @@ static ssize_t thresholdMcStore(struct device *dev,
 /* Archivo sysfs: threshold_mC */
 static struct device_attribute thresholdMcAttr =
    __ATTR(threshold_mC, 0664, thresholdMcShow, thresholdMcStore);
+
 
 
 
@@ -373,6 +405,7 @@ static ssize_t statsShow(struct device *dev,
 /* Archivo sysfs: stats (RO) */
 static struct device_attribute statsAttr =
    __ATTR(stats, 0444, statsShow, NULL);
+
 
 
 
@@ -543,16 +576,6 @@ void simtempInitFromDT(struct simtempDev *sd)
 
 /*********************************************************************/
 
-bool thresholdEvent;
-bool threshEventAux;
-bool notFirstSample = false;  // Control flag to aviod triggering a false threshold event in the first time a sample is generated
-s32 tmprPrevSample;
-s32 globalParam_ThresholdAux;
-
-
-#define FLAGS_NEW_SAMPLE      0x0001
-#define FLAGS_THRESHOLD_CROSS 0x0002
-
 
 
 /*********************************************************************/
@@ -601,7 +624,7 @@ static void readSampleTimerCallback(struct work_struct *work)
    {
       sampleNew.flags |= FLAGS_THRESHOLD_CROSS;
       spin_lock(&sysfsLock);
-      globalStats.alerts++;                     // STATS: Increase amount of times threshold was crossed
+      globalStats.alerts++;                     // STATS: Increase amount of times temperature threshold was crossed
       spin_unlock(&sysfsLock);
 }
    notFirstSample = true;
@@ -653,18 +676,12 @@ static void readSampleTimerCallback(struct work_struct *work)
 /*********************************************************************/
 /*********************************************************************/
 
-char auxMode;
-int auxThreshold;
-
-
 static inline int randomSignedInt(int range)
 {
    return ((int)(get_random_u32() % (2 * range + 1))) - range;
 }
 
 
-int noiseRangeAux;
-s32 tmprBaseAux;
 
 
 static s32 tmprSampleReadADC(void)
@@ -695,15 +712,74 @@ static s32 tmprSampleReadADC(void)
 
 
 
+/****************************************************************/
 /******************* DEVICE READ OPERATION **********************/
+/****************************************************************/
+
+
+/******************* DEVICE OPEN OPERATION ***************************/
+
+// open() allocates a small per-FD context to support short reads.
+static int simtempOpen(struct inode *ino, struct file *f)
+{
+   pr_info("simtemp: open\n");
+
+   /* allocate per-FD context (16B record + offsets) */
+   struct simtempFctx *ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+   if (!ctx)
+      return -ENOMEM;
+   ctx->outOff = 0;
+   ctx->outValid = false;
+   f->private_data = ctx;
+   return 0;
+}
+
+
+/******************* DEVICE RELEASE OPERATION ************************/
+
+
+static int simtempRelease(struct inode *ino, struct file *f)
+{
+    pr_info("simtemp: release\n");
+    if (f->private_data)
+    {
+       // free the per-FD context on close, without altering your logs
+       kfree(f->private_data);
+       f->private_data = NULL;
+    }
+    return 0;
+}
 
 
 static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t *off)
 {
-   #define OUTPUT_SIZE 60
-   ssize_t retVal = OUTPUT_SIZE;
-   char auxStr[OUTPUT_SIZE] = {0};
-   unsigned long notCopied;
+
+   // Retrieve per-FD context (for 16B record + short reads)
+   // If there is a pending partial record, we should continue copying
+   // it BEFORE consuming a new sample from the circular buffer
+   struct simtempFctx *ctx = (struct simtempFctx *)f->private_data;
+   size_t need = sizeof(struct simtempRecord16);
+   if (!ctx)
+      return -EINVAL;
+
+   // If there is an unfinished 16B record, continue copying it now.
+   if (ctx->outValid)
+   {
+      size_t toCopy = need - ctx->outOff;
+      if (toCopy > len) 
+      toCopy = len;
+      if (copy_to_user(buf, ((u8 *)&ctx->out) + ctx->outOff, toCopy))
+         return -EFAULT;
+
+      ctx->outOff += toCopy;
+      if (ctx->outOff == need)
+      {
+         // finished delivering the 16B record
+         ctx->outValid = FALSE;
+         ctx->outOff = 0;
+      }
+      return toCopy;
+   }
 
    spin_lock(&tmprSmplBuffLock);
    if (cbTail == cbHead)  // If no new samples availble to consume
@@ -743,21 +819,47 @@ static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t 
    spin_unlock(&sysfsLock);
 
 
-   
+   // freeze a 16B record for this FD (to support short reads).
+   // we build the exact ABI record from your tmprLastSample.
+   size_t toCopy;
 
+   ctx->out.timestamp_ns = tmprLastSample.timestampNS;
+   ctx->out.temp_mC      = tmprLastSample.tempMC;
+   ctx->out.flags        = tmprLastSample.flags;
 
-   /*
+   ctx->outOff   = 0;
+   ctx->outValid = TRUE;
 
-   spin_lock(&tmprSmplBuffLock);
-   if (MASK_NEW_SMPL == (tmprLastSample.flags & MASK_NEW_SMPL))
-   {   
-      retVal = sizeof(tmprLastSample);
+   /* If the caller passed len=0 we just prepare the record and return 0. */
+   if (len == 0)
+      return 0;
+
+   /* Deliver the first chunk of the 16B record now. The rest (if any)
+      * will be delivered in subsequent read() calls without re-consuming
+      * the circular buffer */
+   toCopy = need;
+   if (toCopy > len) toCopy = len;
+
+   if (copy_to_user(buf, ((u8 *)&ctx->out) + ctx->outOff, toCopy))
+      return -EFAULT;
+
+   ctx->outOff += toCopy;
+   if (ctx->outOff == need)
+   {
+      ctx->outValid = FALSE;
+      ctx->outOff = 0;
    }
-   tmprLastSample = sampleNew;
-   tmprLastSample.flags = tmprLastSample.flags & (!(MASK_NEW_SMPL));
-   spin_unlock(&tmprSmplBuffLock);
+   return toCopy;
 
-   */
+
+   
+#if 0
+   /* Debugg code returning ascii format */
+
+   #define OUTPUT_SIZE 60
+   ssize_t retVal = OUTPUT_SIZE;
+   char auxStr[OUTPUT_SIZE] = {0};
+   unsigned long notCopied;
 
    bool auxFlag1 = ((tmprLastSample.flags & FLAGS_NEW_SAMPLE) == FLAGS_NEW_SAMPLE);
    bool auxFlag2 = ((tmprLastSample.flags & FLAGS_THRESHOLD_CROSS) == FLAGS_THRESHOLD_CROSS);
@@ -771,7 +873,7 @@ static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t 
    if (retVal != 0)
    {
       retVal = OUTPUT_SIZE;
-//        copy_to_user(buf, &tmprLastSample, sizeof(tmprSmplBuffLock));
+      //        copy_to_user(buf, &tmprLastSample, sizeof(tmprSmplBuffLock));
       notCopied = copy_to_user(buf, auxStr, OUTPUT_SIZE);
       if (notCopied)
       {
@@ -781,9 +883,7 @@ static ssize_t simtempRead(struct file *f, char __user *buf, size_t len, loff_t 
    }
    return retVal;
    return -EAGAIN;
-
-
-
+#endif
 }
 
 
@@ -857,24 +957,6 @@ static void timerDeInit(void)
 /*********************************************************************/
 /*********************************************************************/
 
-
-
-/******************* DEVICE OPEN OPERATION ***************************/
-
-static int simtempOpen(struct inode *ino, struct file *f)
-{
-    pr_info("simtemp: open\n");
-    return 0;
-}
-
-/******************* DEVICE RELEASE OPERATION ************************/
-
-
-static int simtempRelease(struct inode *ino, struct file *f)
-{
-    pr_info("simtemp: release\n");
-    return 0;
-}
 
 /******************* DEVICE INIT OPERATION ************************/
 
