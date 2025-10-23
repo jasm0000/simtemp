@@ -28,7 +28,8 @@ enum COMMAND_TYPE
    CMD_SET_SAMPLING,
    CMD_SET_MODE,
    CMD_SET_THRESHOLD,
-   CMD_SHOW_ALL
+   CMD_SHOW_ALL,
+   CMD_TEST
 };
 
 /****************************************************************************/
@@ -55,6 +56,7 @@ static void printHelp()
    cout << "   ./simtempCli --set-mode {normal|noisy|ramp}\n";
    cout << "   ./simtempCli --set-threshold mC\n";
    cout << "   ./simtempCli --show-all\n";
+   cout << "   ./simtempCli --test --period MS --threshold mC\n";
    cout << "\nNotes:\n";
    cout << " - --set-sampling writes /sys/class/misc/simtemp/sampling_ms\n";
    cout << " - --set-mode writes /sys/class/misc/simtemp/mode\n";
@@ -62,6 +64,7 @@ static void printHelp()
    cout << " - --show-all reads sampling_ms, mode, threshold_mC and stats\n";
    cout << " - --timeout applies to --once and --follow; use -1 for infinite wait\n";
    cout << " - --reopen  performs reopen at eof, in cat command style\n";
+   cout << " - --test: set sampling/threshold and expect a threshold alert within 2 periods (non-zero exit on failure)\n";
    cout << " - You can combine --set-xxx with --once/--follow (set first, then read)\n";
 }
 
@@ -340,6 +343,92 @@ static enum READ_RESULT readBinaryOrTextOnce(int fd)
    }
 }
 
+
+/****************************************************************************/
+/****************************************************************************/
+/******************************* TEST MODE **********************************/
+/****************************************************************************/
+/****************************************************************************/
+
+/* Test goal:
+ * - Set sampling_ms and threshold_mC as requested.
+ * - Open /dev/simtemp and wait for a threshold alert (POLLPRI).
+ * - Succeed if alert arrives within <= 2 * period_ms (+ small slack); otherwise fail.
+ */
+static bool runTestMode(int periodMs, int threshold_mC)
+{
+   if (periodMs <= 0)
+   {
+      cerr << "ERROR: --test requires a positive --period\n";
+      return false;
+   }
+
+   // 1) Configure sysfs
+   if (!setSamplingMs((unsigned)periodMs))
+   {
+      cerr << "ERROR: failed to set sampling_ms during --test\n";
+      return false;
+   }
+   if (!setThresholdmC(threshold_mC))
+   {
+      cerr << "ERROR: failed to set threshold_mC during --test\n";
+      return false;
+   }
+
+   // 2) Open the device
+   int fd = open(devPath, O_RDONLY);
+   if (fd < 0)
+   {
+      cerr << "ERROR: Could not open " << devPath << " (" << strerror(errno) << ")\n";
+      return false;
+   }
+
+   // 3) Wait for POLLPRI within 2 periods + 500ms slack
+   int totalTimeoutMs = (2 * periodMs) + 500;
+
+   struct pollfd pfd;
+   pfd.fd = fd;
+   pfd.events = POLLPRI | POLLIN | POLLRDNORM;
+
+   int ret = poll(&pfd, 1, totalTimeoutMs);
+   if (ret < 0)
+   {
+      cerr << "ERROR: poll failed in --test (" << strerror(errno) << ")\n";
+      close(fd);
+      return false;
+   }
+   if (ret == 0)
+   {
+      cerr << "[TEST] FAIL: no alert (POLLPRI) within " << totalTimeoutMs << " ms\n";
+      close(fd);
+      return false;
+   }
+
+   if ((pfd.revents & POLLPRI) == 0)
+   {
+      cerr << "[TEST] FAIL: event arrived but not POLLPRI (revents=0x"
+           << std::hex << pfd.revents << std::dec << ")\n";
+      close(fd);
+      return false;
+   }
+
+   // 4) Consume one read just to clear the condition (format agnostic)
+   char buf[64] = {0};
+   ssize_t n = read(fd, buf, sizeof(buf));
+   if (n < 0)
+   {
+      if (errno != EAGAIN && errno != EWOULDBLOCK)
+      {
+         cerr << "[TEST] WARN: read after POLLPRI failed (" << strerror(errno) << ")\n";
+      }
+   }
+
+   cout << "[TEST] PASS: threshold alert detected via POLLPRI\n";
+   close(fd);
+   return true;
+}
+
+
 /****************************************************************************/
 /****************************************************************************/
 /********************************* ONCE *************************************/
@@ -534,6 +623,8 @@ int main(int argc, char** argv)
    unsigned samplingMs = 0;
    string mode;   
    int thresholdmC = 0;
+   int testPeriodMs = -1;
+   int testThreshmC = -1;
 
    enum COMMAND_TYPE command = CMD_NONE;
 
@@ -585,6 +676,18 @@ int main(int argc, char** argv)
       {
          command = CMD_SHOW_ALL;
       }
+      else if (arg == "--test")
+      {
+         command = CMD_TEST;
+      }
+      else if (arg == "--period" && i + 1 < argc)
+      {
+         testPeriodMs = stoi(argv[++i]);
+      }
+      else if (arg == "--threshold" && i + 1 < argc)
+      {
+         testThreshmC = stoi(argv[++i]);
+      }
       else
       {
          cerr << "Unknown parameters: " << arg << endl;
@@ -623,6 +726,16 @@ int main(int argc, char** argv)
 
       case CMD_SHOW_ALL:
          if (!showAll())
+            return 1;
+         return 0;
+
+      case CMD_TEST:
+         if (testPeriodMs <= 0 || testThreshmC == -1)
+         {
+            cerr << "Usage: --test --period MS --threshold mC\n";
+            return 1;
+         }
+         if (!runTestMode(testPeriodMs, testThreshmC))
             return 1;
          return 0;
 
