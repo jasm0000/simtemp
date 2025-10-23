@@ -56,15 +56,15 @@ static void printHelp()
    cout << "   ./simtempCli --set-mode {normal|noisy|ramp}\n";
    cout << "   ./simtempCli --set-threshold mC\n";
    cout << "   ./simtempCli --show-all\n";
-   cout << "   ./simtempCli --test --period MS --threshold mC\n";
+   cout << "   ./simtempCli --test --period MS\n";
    cout << "\nNotes:\n";
    cout << " - --set-sampling writes /sys/class/misc/simtemp/sampling_ms\n";
    cout << " - --set-mode writes /sys/class/misc/simtemp/mode\n";
    cout << " - --set-threshold writes /sys/class/misc/simtemp/threshold_mC\n";
    cout << " - --show-all reads sampling_ms, mode, threshold_mC and stats\n";
    cout << " - --timeout applies to --once and --follow; use -1 for infinite wait\n";
-   cout << " - --reopen  performs reopen at eof, in cat command style\n";
-   cout << " - --test: set sampling/threshold and expect a threshold alert within 2 periods (non-zero exit on failure)\n";
+   cout << " - --reopen performs reopen at EOF, in cat command style\n";
+   cout << " - --test: forces mode=ramp, uses --period MS, auto-sets threshold and waits for POLLPRI (<= ~2*period)\n";
    cout << " - You can combine --set-xxx with --once/--follow (set first, then read)\n";
 }
 
@@ -343,6 +343,60 @@ static enum READ_RESULT readBinaryOrTextOnce(int fd)
    }
 }
 
+/****************************************************************************/
+/***************** HELPER for deterministc test *************/
+/****************************************************************************/
+
+/* Reads exactly one 16-byte record with a blocking poll first.
+ * Returns true and fills out if successful, false on error/timeout.
+ * NOTE: This assumes the driver now outputs the 16-byte binary format.
+ */
+static bool readOneBinarySampleBlocking(int fd, int timeoutMs, SimtempRecord16 &out)
+{
+   struct pollfd pfd;
+   pfd.fd = fd;
+   pfd.events = POLLIN | POLLRDNORM | POLLPRI;
+
+   int pr = poll(&pfd, 1, timeoutMs);
+   if (pr < 0)
+   {
+      cerr << "ERROR: poll in test read (" << strerror(errno) << ")\n";
+      return false;
+   }
+   if (pr == 0)
+   {
+      cerr << "TEST: poll timeout waiting for sample\n";
+      return false;
+   }
+
+   size_t have = 0;
+   unsigned char *ptr = reinterpret_cast<unsigned char*>(&out);
+   while (have < sizeof(out))
+   {
+      ssize_t n = ::read(fd, ptr + have, sizeof(out) - have);
+      if (n < 0)
+      {
+         if (errno == EINTR) continue;
+         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+         cerr << "ERROR: read in test (" << strerror(errno) << ")\n";
+         return false;
+      }
+      if (n == 0)
+      {
+         cerr << "TEST: EOF while reading sample\n";
+         return false;
+      }
+      have += (size_t)n;
+   }
+
+   if (have != sizeof(out))
+   {
+      cerr << "TEST: short read (" << have << " bytes)\n";
+      return false;
+   }
+   return true;
+}
+
 
 /****************************************************************************/
 /****************************************************************************/
@@ -350,12 +404,13 @@ static enum READ_RESULT readBinaryOrTextOnce(int fd)
 /****************************************************************************/
 /****************************************************************************/
 
-/* Test goal:
- * - Set sampling_ms and threshold_mC as requested.
- * - Open /dev/simtemp and wait for a threshold alert (POLLPRI).
- * - Succeed if alert arrives within <= 2 * period_ms (+ small slack); otherwise fail.
+/* Test:
+ * 1) set mode=ramp and sampling_ms=periodMs
+ * 2) open /dev/simtemp and read one sample S
+ * 3) set threshold_mC = S + 1
+ * 4) wait for POLLPRI within <= 2*periodMs + 500 ms
  */
-static bool runTestMode(int periodMs, int threshold_mC)
+static bool runTestMode(int periodMs)
 {
    if (periodMs <= 0)
    {
@@ -363,19 +418,19 @@ static bool runTestMode(int periodMs, int threshold_mC)
       return false;
    }
 
-   // 1) Configure sysfs
+   // 1) Configure sysfs (force ramp mode first)
+   if (!setMode(string("ramp")))
+   {
+      cerr << "ERROR: failed to set mode=ramp during --test\n";
+      return false;
+   }
    if (!setSamplingMs((unsigned)periodMs))
    {
       cerr << "ERROR: failed to set sampling_ms during --test\n";
       return false;
    }
-   if (!setThresholdmC(threshold_mC))
-   {
-      cerr << "ERROR: failed to set threshold_mC during --test\n";
-      return false;
-   }
 
-   // 2) Open the device
+   // 2) Open device and read one binary sample S
    int fd = open(devPath, O_RDONLY);
    if (fd < 0)
    {
@@ -383,9 +438,25 @@ static bool runTestMode(int periodMs, int threshold_mC)
       return false;
    }
 
-   // 3) Wait for POLLPRI within 2 periods + 500ms slack
-   int totalTimeoutMs = (2 * periodMs) + 500;
+   SimtempRecord16 first{};
+   int t1 = periodMs + 500;  // small slack to be safe
+   if (!readOneBinarySampleBlocking(fd, t1, first))
+   {
+      close(fd);
+      return false;
+   }
 
+   // 3) threshold = S + 1 mC (forces a crossing next tick in ramp mode)
+   int autoThresh = first.temp_mC + 1;
+   if (!setThresholdmC(autoThresh))
+   {
+      cerr << "ERROR: failed to set threshold_mC during --test\n";
+      close(fd);
+      return false;
+   }
+
+   // 4) Wait for POLLPRI within <= 2*period + 500 ms
+   int totalTimeoutMs = (2 * periodMs) + 500;
    struct pollfd pfd;
    pfd.fd = fd;
    pfd.events = POLLPRI | POLLIN | POLLRDNORM;
@@ -399,7 +470,7 @@ static bool runTestMode(int periodMs, int threshold_mC)
    }
    if (ret == 0)
    {
-      cerr << "[TEST] FAIL: no alert (POLLPRI) within " << totalTimeoutMs << " ms\n";
+      cerr << "[TEST] FAIL: no POLLPRI within " << totalTimeoutMs << " ms\n";
       close(fd);
       return false;
    }
@@ -412,18 +483,11 @@ static bool runTestMode(int periodMs, int threshold_mC)
       return false;
    }
 
-   // 4) Consume one read just to clear the condition (format agnostic)
-   char buf[64] = {0};
-   ssize_t n = read(fd, buf, sizeof(buf));
-   if (n < 0)
-   {
-      if (errno != EAGAIN && errno != EWOULDBLOCK)
-      {
-         cerr << "[TEST] WARN: read after POLLPRI failed (" << strerror(errno) << ")\n";
-      }
-   }
+   // Consume one read to clear condition
+   char buf[32] = {0};
+   buf[0] = read(fd, buf, sizeof(buf));
 
-   cout << "[TEST] PASS: threshold alert detected via POLLPRI\n";
+   cout << "[TEST] PASS: threshold alert detected via POLLPRI (ramp)\n";
    close(fd);
    return true;
 }
@@ -621,7 +685,7 @@ int main(int argc, char** argv)
    bool nonblock    = false;
    bool reopenOnEof = false;
    unsigned samplingMs = 0;
-   string mode;   
+   string mode;
    int thresholdmC = 0;
    int testPeriodMs = -1;
    int testThreshmC = -1;
@@ -730,12 +794,12 @@ int main(int argc, char** argv)
          return 0;
 
       case CMD_TEST:
-         if (testPeriodMs <= 0 || testThreshmC == -1)
+         if (testPeriodMs <= 0)
          {
-            cerr << "Usage: --test --period MS --threshold mC\n";
+            cerr << "Usage: --test --period MS\n";
             return 1;
          }
-         if (!runTestMode(testPeriodMs, testThreshmC))
+         if (!runTestMode(testPeriodMs))
             return 1;
          return 0;
 
