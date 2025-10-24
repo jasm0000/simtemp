@@ -67,6 +67,8 @@ The store functions use the regular spin_lock / spin_unlock, as they are trigger
 Wait queues (wait_event_interruptible) are used for blocking reads.
 When new data arrives or an alert occurs, the queue is awakened safely under the protection of the spinlock.
 
+**Spinlocks** are the proper concurrency protection mecanisms at Kernel space beacause **Mutexes** send the thread to sleep when the lock condition happens, and in Kernel space that is much more critical than in user space, that's why spinlocks does not send the thread to sleep, instead it performs an active wait until condition gets unlocked, that's why spinlocks are more critical and should be used in very short locked sections to minimize the lock time.
+
 ## **5. API Design and Trade-Offs**
 ### **SysFS**
 
@@ -80,6 +82,10 @@ compatible = "nxp,simtemp";
 
 Default properties (sampling period, threshold) are defined internally for cases where the DT is absent, such as x86 virtual testing.
 
+The driver includes an of_match_table with the compatible string "nxp,simtemp".
+On real i.MX or QEMU targets, it would bind automatically when this node is present in the device tree.
+For environments without a populated DT, the module registers a fallback platform_device so it can operate standalone for testing.
+
 Although the implementation currently creates a local platform device for simplicity, the same driver could bind automatically to a DT node on an i.MX or QEMU-ARM64 system by adding the snippet below:
 
 simtemp0: simtemp@0 {
@@ -88,6 +94,7 @@ simtemp0: simtemp@0 {
     threshold-mC = <45000>;
     status = "okay";
 };
+
 
 ## **7. Data Handling and Binary Format**
 Each sample is represented by a 16-byte packed structure:

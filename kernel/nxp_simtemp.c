@@ -599,7 +599,8 @@ static void readSampleTimerCallback(struct work_struct *work)
    timerReset();
    tmprNewSample = tmprSampleReadADC();
    sampleNew.tempMC = tmprNewSample;
-   sampleNew.timestampNS = ktime_get_ns();
+   //sampleNew.timestampNS = ktime_get_ns();
+   sampleNew.timestampNS = ktime_get_real_ns();
    sampleNew.flags = FLAGS_NEW_SAMPLE;
    sampleNew.consecutive = simCnt;
    s32 lostSample = -1;
@@ -662,6 +663,7 @@ static void readSampleTimerCallback(struct work_struct *work)
 /*********************************************************************/
 /*********************************************************************/
 
+/* Returns a random variance limited to range */
 static inline int randomSignedInt(int range)
 {
    return ((int)(get_random_u32() % (2 * range + 1))) - range;

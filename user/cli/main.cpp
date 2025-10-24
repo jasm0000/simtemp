@@ -19,6 +19,8 @@
 #include <poll.h>
 #include <stdint.h>
 #include <algorithm>
+#include <iomanip>
+
 
 using namespace std;
 
@@ -59,23 +61,6 @@ struct __attribute__((packed)) SimtempRecord16
    uint32_t flags;         /* bit0=NEW_SAMPLE, bit1=THRESHOLD */
 };
 
-/* Make human-readable output from a decoded 16B record. */
-#include <iomanip>
-#include <iostream>
-
-#include <iomanip>
-#include <iostream>
-
-static void printSampleHuman(const SimtempRecord16& r) 
-{ 
-   double t_ms = static_cast<double>(r.timestamp_ns) / 1e6; 
-   double t_C = static_cast<double>(r.temp_mC) / 1000.0; 
-   unsigned alert = (r.flags & (1u << 1)) ? 1u : 0u; 
-   cout << "t_ms = " << t_ms 
-        << " temp = " << t_C 
-        << "C Thresh. alert = " 
-        << alert << "\n"; 
-}
 /* enum to report how a read attempt finished. */
 enum READ_RESULT
 {
@@ -259,6 +244,37 @@ static bool showAll()
 /********************** 16-BYTE BINARY SAMPLE RECORD READ *******************/
 /****************************************************************************/
 
+/* Make human-readable output from a decoded 16B record. */
+static void printSampleHuman(const SimtempRecord16& r)
+{
+   // Convert seconds to nano seconds
+   time_t sec = r.timestamp_ns / 1000000000ULL;
+   long nsec = r.timestamp_ns % 1000000000ULL;
+
+   // Convert time to UTC
+   struct tm tm_utc;
+   gmtime_r(&sec, &tm_utc);
+
+   // string type ISO 8601: YYYY-MM-DDTHH:MM:SS.mmmZ
+   char timeBuf[64];
+   int millis = static_cast<int>(nsec / 1000000);
+   snprintf(timeBuf, sizeof(timeBuf),
+            "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+            tm_utc.tm_year + 1900,
+            tm_utc.tm_mon + 1,
+            tm_utc.tm_mday,
+            tm_utc.tm_hour,
+            tm_utc.tm_min,
+            tm_utc.tm_sec,
+            millis);
+
+   double t_C = static_cast<double>(r.temp_mC) / 1000.0;
+   unsigned alert = (r.flags & (1u << 1)) ? 1u : 0u;
+
+   std::cout << timeBuf
+             << " temp=" << std::fixed << std::setprecision(3) << t_C
+             << "C alert=" << alert << std::endl;
+}
 
 /* 
  * Try to accumulate exactly 16 bytes and decode the binary record.
@@ -272,7 +288,6 @@ static bool showAll()
 static enum READ_RESULT readBinaryOrTextOnce(int fd)
 {
    alignas(SimtempRecord16) unsigned char recBuf[sizeof(SimtempRecord16)] = {};
-   // static_assert(sizeof(SimtempRecord16) == 16, "SimtempRecord16 must be 16 bytes");
 
    size_t have = 0;
 
@@ -545,9 +560,6 @@ static bool readOnce(bool nonblock, int timeoutMs)
    struct pollfd pfd;
    pfd.fd = fd;
    pfd.events = POLLIN | POLLRDNORM | POLLPRI;
-   //pfd.events = POLLPRI;
-
-
 
    int ret = poll(&pfd, 1, timeoutMs);
    if (ret < 0)
@@ -753,8 +765,6 @@ static bool waitAlertOnly(int timeoutMs)
       return false;
    }
 
-   // Optional: one read to clear the condition (format agnostic).
-   // Not strictly required; safe to leave as best-effort.
    char buf[32] = {0};
    ssize_t n = read(fd, buf, sizeof(buf));
    (void)n;
