@@ -200,3 +200,7 @@ Contact: jorgsanc@yahoo.com
 - **TESTSPLAN.md** – Detailed description of the six required tests and their expected outcomes.
 - **AI_NOTES.md** – Some of the prompts made to AI as part of the investigation required to develop the project.
 
+## Submission Links
+
+- **Git repository:** https://github.com/jasm0000/simtemp
+- **Demo video:** https://drive.google.com/file/d/1jRSOxgL-DzlPLWg17i5EvUwMpWusiNO-/view?usp=drive_link
