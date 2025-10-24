@@ -1,4 +1,4 @@
-﻿# **README – Virtual Temperature Sensor (simtemp)**
+﻿# **README – Virtual Temperature Sensor (simtemp) Version 1.0.0**
 
 ## **1. Project usage basic instructions**
 

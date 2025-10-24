@@ -31,7 +31,7 @@
 /************************* MACRO DEFINITIONS **************************/
 /**********************************************************************/
 
-#define VERSION "b001"
+#define VERSION "1.0.0"
 
 #define SIMTEMP_MODE_DEFAULT         SIMTEMP_MODE_NORMAL
 #define SIMTEMP_THRESH_DEFAULT       45000

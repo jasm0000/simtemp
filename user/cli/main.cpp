@@ -30,6 +30,8 @@ using namespace std;
 /****************************************************************************/
 /****************************************************************************/
 
+#define VERSION "1.0.0"
+
 static const char* devPath  = "/dev/simtemp";
 static const char* sysfsDir = "/sys/class/misc/simtemp";
 
@@ -79,7 +81,7 @@ enum READ_RESULT
 
 static void printHelp()
 {
-   cout << "simtempCLI (Temperature Simulator - CLI, Version 1.0)\n";
+   cout << "simtempCLI (Temperature Simulator - CLI, Version: "<< VERSION <<" )\n";
    cout << "Usage:\n";
    cout << "   ./simtempCLI --once              [--nonblock] [--timeout MS]\n";
    cout << "   ./simtempCLI --follow            [--nonblock] [--timeout MS] [--reopen]\n";
