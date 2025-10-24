@@ -190,6 +190,7 @@ ssize_t samplingMsShow(struct device *dev,
                               struct device_attribute *attr,
                               char *buf);
 void resetGlobalModeParams(void);
+static void timerReset(void);
 
 
 
@@ -201,7 +202,7 @@ static const struct file_operations simtempFOps =
    .read    = simtempRead,
    .open    = simtempOpen,
    .release = simtempRelease,
-   .poll  = simtempPoll,
+   .poll    = simtempPoll,
 };
 
 
@@ -449,7 +450,7 @@ ssize_t samplingMsStore(struct device *dev,
    spin_lock(&sysfsLock);
    globalParam_SmplRate = val;
    spin_unlock(&sysfsLock);
-
+   timerReset();
    pr_info("SYSFS: Sample rate was updated from %u to %u\n", oldVal, globalParam_SmplRate);
 
    return count;
@@ -586,14 +587,11 @@ void simtempInitFromDT(struct simtempDev *sd)
 
 static void timerReset(void)
 {
-   //schedule_delayed_work(&readSampleTimer, 2 * HZ);
-
    u32 smplRate_Aux;
    spin_lock(&sysfsLock);
    smplRate_Aux = globalParam_SmplRate; // Using an aux variable to reduce the exclusive area time
-   spin_unlock(&sysfsLock);
-
    schedule_delayed_work(&readSampleTimer, msecs_to_jiffies((unsigned long)smplRate_Aux));
+   spin_unlock(&sysfsLock);
 }
 
 /******************** TIMER CALL BACK ****************************/
@@ -648,7 +646,12 @@ static void readSampleTimerCallback(struct work_struct *work)
    pr_info("TMR: thresholdEvent = %d\n",thresholdEvent);
    spin_unlock(&tmprSmplBuffLock);
 
-   wake_up_interruptible(&simtempWait);
+   /*  Wakes up the read operation flagging that there is a new sample available */
+   wake_up_interruptible(&simtempWait); 
+   if (threshEventAux)
+   {
+      wake_up_interruptible_poll(&simtempWait, EPOLLPRI);
+   }
 
     
    if (lostSample != -1)
@@ -910,7 +913,7 @@ static __poll_t simtempPoll(struct file *file, poll_table *wait)
    /* Reportar qué eventos están listos */
    spin_lock(&tmprSmplBuffLock);
 
-   /* Datos listos para leer → POLLIN | POLLRDNORM */
+   /* Datos listos para leer :  POLLIN | POLLRDNORM */
    if (cbTail != cbHead)
       mask |= POLLIN | POLLRDNORM;
 
@@ -946,7 +949,9 @@ static void sysfsInit(void)
 
 static void timerDeInit(void)
 {
-    cancel_delayed_work_sync(&readSampleTimer);
+   spin_lock(&sysfsLock);
+   cancel_delayed_work_sync(&readSampleTimer);
+   spin_unlock(&sysfsLock);
 }
 
 
@@ -995,7 +1000,7 @@ static int __init simtempInit(void)
    /* Fallback: crea un platform_device solo si NO hay DT poblado */
    if (!of_have_populated_dt()) 
    {
-      pr_info("INIT: no hay DT poblado → creando fallback platform_device\n");
+      pr_info("INIT: no hay DT poblado :  creando fallback platform_device\n");
       simtemp_pdev_fallback = platform_device_register_simple("nxp_simtemp", PLATFORM_DEVID_AUTO, NULL, 0);
       if (IS_ERR(simtemp_pdev_fallback)) 
       {
@@ -1007,10 +1012,10 @@ static int __init simtempInit(void)
    } 
    else 
    {
-      pr_info("INIT: DT sí está poblado → NO se crea fallback\n");
+      pr_info("INIT: DT sí está poblado :  NO se crea fallback\n");
    }
-   timerInit();
    sysfsInit();
+   timerInit();
    updateNoiseParams();
    rampSample = globalParam_Threshold - RAMP_RANGE;
    pr_info("INIT: simtemp: platform driver registered\n");

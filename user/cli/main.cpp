@@ -50,13 +50,13 @@ static void printHelp()
 {
    cout << "simtempCLI (hello)\n";
    cout << "Usage:\n";
-   cout << "   ./simtempCli --once              [--nonblock] [--timeout MS]\n";
-   cout << "   ./simtempCli --follow            [--nonblock] [--timeout MS] [--reopen]\n";
-   cout << "   ./simtempCli --set-sampling MS\n";
-   cout << "   ./simtempCli --set-mode {normal|noisy|ramp}\n";
-   cout << "   ./simtempCli --set-threshold mC\n";
-   cout << "   ./simtempCli --show-all\n";
-   cout << "   ./simtempCli --test --period MS\n";
+   cout << "   ./simtempCLI --once              [--nonblock] [--timeout MS]\n";
+   cout << "   ./simtempCLI --follow            [--nonblock] [--timeout MS] [--reopen]\n";
+   cout << "   ./simtempCLI --set-sampling MS\n";
+   cout << "   ./simtempCLI --set-mode {normal|noisy|ramp}\n";
+   cout << "   ./simtempCLI --set-threshold mC\n";
+   cout << "   ./simtempCLI --show-all\n";
+   cout << "   ./simtempCLI --test --period MS\n";
    cout << "\nNotes:\n";
    cout << " - --set-sampling writes /sys/class/misc/simtemp/sampling_ms\n";
    cout << " - --set-mode writes /sys/class/misc/simtemp/mode\n";
@@ -83,7 +83,7 @@ static bool writeTextFile(const string& path, const string& value)
       if (errno == EACCES)
       {
          std::cerr << "Hint: run with sudo, e.g.:\n"
-                  << "  sudo ./simtempCli --set-sampling " << value << "\n";
+                  << "  sudo ./simtempCLI --set-sampling " << value << "\n";
       }
       return false;
    }
@@ -439,7 +439,11 @@ static bool runTestMode(int periodMs)
    }
 
    SimtempRecord16 first{};
-   int t1 = periodMs + 500;  // small slack to be safe
+   //int t1 = periodMs + 500;  // small slack to be safe
+   //int t1 = 2*  periodMs + 500;  // small slack to be safe
+   //int t1 = 4 * periodMs + 500;  // small slack to be safe
+   int t1 = max( (2 * periodMs) + 500, 1500 );  // 1500ms cubre el default de 1000ms
+
    if (!readOneBinarySampleBlocking(fd, t1, first))
    {
       close(fd);
@@ -688,7 +692,6 @@ int main(int argc, char** argv)
    string mode;
    int thresholdmC = 0;
    int testPeriodMs = -1;
-   int testThreshmC = -1;
 
    enum COMMAND_TYPE command = CMD_NONE;
 
@@ -748,10 +751,6 @@ int main(int argc, char** argv)
       {
          testPeriodMs = stoi(argv[++i]);
       }
-      else if (arg == "--threshold" && i + 1 < argc)
-      {
-         testThreshmC = stoi(argv[++i]);
-      }
       else
       {
          cerr << "Unknown parameters: " << arg << endl;
@@ -800,7 +799,9 @@ int main(int argc, char** argv)
             return 1;
          }
          if (!runTestMode(testPeriodMs))
+         {
             return 1;
+         }
          return 0;
 
       case CMD_NONE:

@@ -1,27 +1,46 @@
 #!/bin/bash
+# build -> kernel + CLI
 
-# build kernel module + CLI
+set -euo pipefail
 
-echo "[build] using kernel headers at /lib/modules/$(uname -r)/build"
-KDIR="/lib/modules/$(uname -r)/build"
+PROJECT_ROOT="${PROJECT_ROOT:-"$(cd "$(dirname "$0")/.." && pwd)"}"
 
-# build driver
-if [ -d "kernel" ]; then
-  echo "[build] making kernel module..."
-  make -C "$KDIR" M="$(pwd)/kernel" modules || { echo "make failed"; exit 1; }
+KERNEL_DIR="$PROJECT_ROOT/kernel"
+CLI_DIR="$PROJECT_ROOT/user/cli"
+
+MAKE_ARGS=( "$@" )
+
+echo
+echo "[build] Project root : $PROJECT_ROOT"
+echo "[build] Kernel dir   : $KERNEL_DIR"
+echo "[build] CLI dir      : $CLI_DIR"
+echo
+
+# ---- Kernel ----
+if [[ -d "$KERNEL_DIR" ]]; then
+  echo "[build] Building kernel module..."
+  pushd "$KERNEL_DIR" >/dev/null
+  make "${MAKE_ARGS[@]}"
+  popd >/dev/null
 else
-  echo "[build] no 'kernel' dir found (skipping module build)"
-fi
-
-# build CLI
-if [ -f "simtemp/user/cli/main.cpp" ]; then
-  echo "[build] building CLI..."
-  g++ -O2 -Wall -std=c++17 -o simtempCLI simtemp/user/cli/main.cpp || { echo "g++ failed"; exit 1; }
-else
-  echo "[build] CLI source not found at simtemp/user/cli/main.cpp"
+  echo "[build] ERROR: No existe $KERNEL_DIR"
   exit 1
 fi
+echo
 
-echo "[build] done."
-echo "  module: $(ls -1 kernel/*.ko 2>/dev/null || echo 'none')"
-echo "  cli   : ./simtempCLI"
+# ---- CLI ----
+if [[ -d "$CLI_DIR" ]]; then
+  echo "[build] Building CLI..."
+  pushd "$CLI_DIR" >/dev/null
+  make "${MAKE_ARGS[@]}"
+  popd >/dev/null
+else
+  echo "[build] ERROR: No existe $CLI_DIR"
+  exit 1
+fi
+echo
+
+ko=$(ls -1 "$KERNEL_DIR"/*.ko 2>/dev/null || true)
+echo "[build] Done."
+echo "  module: ${ko:-none found}"
+echo "  cli   : built via Makefile in $CLI_DIR"
