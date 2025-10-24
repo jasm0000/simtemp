@@ -1,3 +1,13 @@
+/********************************************************************************/
+/*                                                                              */
+/*  Project:     Linux kernel + user-space CLI challenge project                */
+/*  Module:      main.cpp                                                       */
+/*  Description: Command Line Interface user space consumer                     */
+/*  Author:      Jorge A. Sánchez                                               */
+/*  Date:        24 / OCT / 2025                                                */
+/*                                                                              */
+/********************************************************************************/
+
 // simtemp/user/cli/main.cpp
 #include <iostream>
 #include <string>
@@ -17,6 +27,7 @@ using namespace std;
 /****************************** GLOBAL CONSTANTS ****************************/
 /****************************************************************************/
 /****************************************************************************/
+
 static const char* devPath  = "/dev/simtemp";
 static const char* sysfsDir = "/sys/class/misc/simtemp";
 
@@ -34,9 +45,35 @@ enum COMMAND_TYPE
 
 /****************************************************************************/
 /****************************************************************************/
-/****************************** GLOBAL VARIABLES ****************************/
+/****************************** TYPE DEFINITIONS ****************************/
 /****************************************************************************/
 /****************************************************************************/
+
+
+
+struct __attribute__((packed)) SimtempRecord16
+{
+   uint64_t timestamp_ns;  /* monotonic ns */
+   int32_t  temp_mC;       /* milli °C */
+   uint32_t flags;         /* bit0=NEW_SAMPLE, bit1=THRESHOLD */
+};
+
+/* Make human-readable output from a decoded 16B record. */
+static void printSampleHuman(const SimtempRecord16& r)
+{
+   double t_ms = static_cast<double>(r.timestamp_ns) / 1e6;
+   double t_C  = static_cast<double>(r.temp_mC) / 1000.0;
+   unsigned alert = (r.flags & (1u << 1)) ? 1u : 0u;
+   cout << "t_ms=" << t_ms << " temp=" << t_C << "C alert=" << alert << "\n";
+}
+
+/* enum to report how a read attempt finished. */
+enum READ_RESULT
+{
+   RR_OK = 0,   /* printed something successfully (binary or ASCII) */
+   RR_EOF,      /* got EOF while trying to read */
+   RR_ERR       /* fatal read error */
+};
 
 
 
@@ -153,6 +190,8 @@ static bool readTextFile(const string& path, string& out)
    return true;
 }
 
+
+/* One single CLI option to read all SYSFS parameters */
 static bool showAll()
 {
    bool ok = true;
@@ -209,29 +248,6 @@ static bool showAll()
 /********************** 16-BYTE BINARY SAMPLE RECORD READ *******************/
 /****************************************************************************/
 
-struct __attribute__((packed)) SimtempRecord16
-{
-   uint64_t timestamp_ns;  /* monotonic ns */
-   int32_t  temp_mC;       /* milli °C */
-   uint32_t flags;         /* bit0=NEW_SAMPLE, bit1=THRESHOLD */
-};
-
-/* Make human-readable output from a decoded 16B record. */
-static void printSampleHuman(const SimtempRecord16& r)
-{
-   double t_ms = static_cast<double>(r.timestamp_ns) / 1e6;
-   double t_C  = static_cast<double>(r.temp_mC) / 1000.0;
-   unsigned alert = (r.flags & (1u << 1)) ? 1u : 0u;
-   cout << "t_ms=" << t_ms << " temp=" << t_C << "C alert=" << alert << "\n";
-}
-
-/* enum to report how a read attempt finished. */
-enum READ_RESULT
-{
-   RR_OK = 0,   /* printed something successfully (binary or ASCII) */
-   RR_EOF,      /* got EOF while trying to read */
-   RR_ERR       /* fatal read error */
-};
 
 /* 
  * Try to accumulate exactly 16 bytes and decode the binary record.
@@ -301,7 +317,6 @@ static enum READ_RESULT readBinaryOrTextOnce(int fd)
       {
          size_t copy = have;
          if (copy > sizeof(buf) - 1) copy = sizeof(buf) - 1;
-         //memcpy(buf, recBuf, copy);
          std::copy_n(recBuf, copy, buf); 
          used = copy;
       }
@@ -344,12 +359,11 @@ static enum READ_RESULT readBinaryOrTextOnce(int fd)
 }
 
 /****************************************************************************/
-/***************** HELPER for deterministc test *************/
+/********************** HELPER FOR 16B READING ******************************/
 /****************************************************************************/
 
 /* Reads exactly one 16-byte record with a blocking poll first.
  * Returns true and fills out if successful, false on error/timeout.
- * NOTE: This assumes the driver now outputs the 16-byte binary format.
  */
 static bool readOneBinarySampleBlocking(int fd, int timeoutMs, SimtempRecord16 &out)
 {
@@ -439,10 +453,7 @@ static bool runTestMode(int periodMs)
    }
 
    SimtempRecord16 first{};
-   //int t1 = periodMs + 500;  // small slack to be safe
-   //int t1 = 2*  periodMs + 500;  // small slack to be safe
-   //int t1 = 4 * periodMs + 500;  // small slack to be safe
-   int t1 = max( (2 * periodMs) + 500, 1500 );  // 1500ms cubre el default de 1000ms
+   int t1 = max( (2 * periodMs) + 500, 1500 );  // 1500ms covers 1000ms default
 
    if (!readOneBinarySampleBlocking(fd, t1, first))
    {
@@ -503,7 +514,7 @@ static bool runTestMode(int periodMs)
 /****************************************************************************/
 /****************************************************************************/
 
-// Reads a single sample from /dev/simtemp
+// Reads one single sample from /dev/simtemp
 static bool readOnce(bool nonblock, int timeoutMs)
 {
    int flags = O_RDONLY;
