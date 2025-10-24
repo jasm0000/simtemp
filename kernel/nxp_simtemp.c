@@ -33,7 +33,7 @@
 
 #define VERSION "b001"
 
-#define SIMTEMP_MODE_DEFAULT         SIMTEMP_MODE_RAMP
+#define SIMTEMP_MODE_DEFAULT         SIMTEMP_MODE_NORMAL
 #define SIMTEMP_THRESH_DEFAULT       45000
 #define SIMTEMP_SAMPLING_MS_DEFAULT  1000U
 
@@ -457,34 +457,55 @@ static void simtemp_parse_dt(struct simtempDevDT *sd, struct device *dev)
 {
    struct device_node *np = dev->of_node;
    u32 u;
+   const char *mstr;                                   
 
    /* Defaults */
    sd->sampling_ms  = SIMTEMP_SAMPLING_MS_DEFAULT;
    sd->threshold_mC = SIMTEMP_THRESH_DEFAULT;
-   sd->mode = SIMTEMP_MODE_DEFAULT;
+   sd->mode         = SIMTEMP_MODE_DEFAULT;
 
-   if (!np)
+   if (!np) 
    {
       pr_info("PARSE DT: Using defaults\n");
       return;
    }
 
-   if (!of_property_read_u32(np, "sampling-ms", &u))
+   if (!of_property_read_u32(np, "sampling-ms", &u)) 
    {
+      /* clamp to valid range */
+      if (u < SIMTEMP_SAMPLING_MS_MIN) 
+         u = SIMTEMP_SAMPLING_MS_MIN;
+      if (u > SIMTEMP_SAMPLING_MS_MAX) 
+         u = SIMTEMP_SAMPLING_MS_MAX;
       sd->sampling_ms = u;
    }
 
-   if (!of_property_read_u32(np, "threshold-mC", &u))
+   if (!of_property_read_u32(np, "threshold-mC", &u)) 
    {
+      /* clamp to valid range */
+      if ((int)u < SIMTEMP_THRESH_MIN_mC) 
+         u = (u32)SIMTEMP_THRESH_MIN_mC;
+      if ((int)u > SIMTEMP_THRESH_MAX_mC) 
+         u = (u32)SIMTEMP_THRESH_MAX_mC;
       sd->threshold_mC = (int)u;
    }
-      
+
+   if (!of_property_read_string(np, "mode", &mstr)) 
+   {
+      if (sysfs_streq(mstr, "normal"))      
+         sd->mode = SIMTEMP_MODE_NORMAL;
+      else if (sysfs_streq(mstr, "noisy"))  
+         sd->mode = SIMTEMP_MODE_NOISY;
+      else if (sysfs_streq(mstr, "ramp"))   
+         sd->mode = SIMTEMP_MODE_RAMP;
+      else                                   
+         pr_warn("SIMTEMP DT: unknown mode '%s', keeping default\n", mstr);
+   }
 }
 
 static int simtemp_probe(struct platform_device *pdev)
 {
    struct simtempDevDT *sd;
-   // int ret = 0;
 
    sd = devm_kzalloc(&pdev->dev, sizeof(*sd), GFP_KERNEL);
    if (!sd)
@@ -496,16 +517,22 @@ static int simtemp_probe(struct platform_device *pdev)
    sd->dev = &pdev->dev;
    platform_set_drvdata(pdev, sd);
 
-   /* Lee properties desde DT (o defaults si no hay of_node) */
+   /* Read DT properties of defaults if there is not of_node */
    simtemp_parse_dt(sd, &pdev->dev);
 
    simtempInitFromDT(sd);    
 
-   // ret = simtemp_core_init(sd);
-   // if (ret) return ret;
+   // Re calculate numbers with DT params
+   updateNoiseParams();                   
+   rampSample = globalParam_Threshold - RAMP_RANGE;
+   timerReset();                                   
 
-   dev_info(&pdev->dev, "simtemp probed: sampling_ms=%u, threshold_mC=%d\n",
-            sd->sampling_ms, sd->threshold_mC);
+   dev_info(&pdev->dev,
+         "simtemp probed: sampling_ms=%u, threshold_mC=%d, mode=%s\n",
+         sd->sampling_ms, sd->threshold_mC,
+         (globalParam_Mode == SIMTEMP_MODE_NORMAL) ? "normal" :
+         (globalParam_Mode == SIMTEMP_MODE_NOISY)  ? "noisy"  : "ramp");
+
    return 0;
 }
 
@@ -550,15 +577,18 @@ void simtempInitFromDT(struct simtempDevDT *sd)
 static void timerReset(void)
 {
    u32 smplRate_Aux;
-   spin_lock(&sysfsLock);
+   unsigned long flags;
+   // Protect concurrency
+   spin_lock_irqsave(&sysfsLock, flags);
    smplRate_Aux = globalParam_SmplRate; // Using an aux variable to reduce the exclusive area time
+   spin_unlock_irqrestore(&sysfsLock, flags);
    schedule_delayed_work(&readSampleTimer, msecs_to_jiffies((unsigned long)smplRate_Aux));
-   spin_unlock(&sysfsLock);
 }
 
 /******************** TIMER CALL BACK ****************************/
 
 /* Declared inline to be faster executed inside the critical timer "interrupt"*/
+/* Returns true if temperature threshold was crossed between previous and current samples*/
 static inline bool detectThresholdCross(s32 prev, s32 curr, s32 threshold)
 {
    return ((prev < threshold) != (curr < threshold));
@@ -587,12 +617,12 @@ static void readSampleTimerCallback(struct work_struct *work)
       spin_lock(&sysfsLock);
       globalStats.alerts++;                     // STATS: Increase amount of times temperature threshold was crossed
       spin_unlock(&sysfsLock);
-}
+   }
    notFirstSample = true;
    tmprPrevSample = tmprNewSample;
 
 
-   pr_info("Timer ejecutado, muestra numero: %i = %i, at: %llu\n",simCnt++, tmprNewSample, sampleNew.timestampNS);
+   pr_info("Timer executed, sample number: %i = %i, at: %llu\n",simCnt++, tmprNewSample, sampleNew.timestampNS);
     
    // head always point to the next position to be written in the circ buffer
    spin_lock(&tmprSmplBuffLock);
@@ -605,7 +635,7 @@ static void readSampleTimerCallback(struct work_struct *work)
    }
    cbHead = (cbHead + 1) % TMPR_SMPL_CIRC_BUFF_SIZE;
    thresholdEvent |= threshEventAux;
-   pr_info("TMR: thresholdEvent = %d\n",thresholdEvent);
+   // pr_info("TMR: thresholdEvent = %d\n",thresholdEvent);
    spin_unlock(&tmprSmplBuffLock);
 
    /*  Wakes up the read operation flagging that there is a new sample available */
@@ -620,10 +650,9 @@ static void readSampleTimerCallback(struct work_struct *work)
       spin_lock(&sysfsLock);
       globalStats.overruns++;                     // STATS: Increase amount of lost samples
       spin_unlock(&sysfsLock);
-      pr_info("Se perdió la %i \n",lostSample);
+      pr_info("Sample number %i lost.\n",lostSample);
 
    }
-
 }
 
 
@@ -861,9 +890,8 @@ static __poll_t simtempPoll(struct file *file, poll_table *wait)
    
    if (thresholdEvent)
    {
-      pr_info("POLL: thresholdEvent = 1\n");
+      //pr_info("POLL: thresholdEvent = 1\n");
       mask |= POLLPRI;
-      //thresholdEvent = false;
    }
    spin_unlock(&tmprSmplBuffLock);
 
@@ -889,9 +917,7 @@ static void sysfsInit(void)
 
 static void timerDeInit(void)
 {
-   spin_lock(&sysfsLock);
    cancel_delayed_work_sync(&readSampleTimer);
-   spin_unlock(&sysfsLock);
 }
 
 
@@ -918,7 +944,7 @@ static int __init simtempInit(void)
    }
 
 
-   /* Cuelga el grupo completo en: /sys/class/misc/simtemp/ */
+   /* Create the sysfs group under: /sys/class/misc/simtemp/ */
    retVal = sysfs_create_group(&simtempMiscDev.this_device->kobj, &simtempAttrGroup);
    if (retVal)
    {
@@ -927,12 +953,12 @@ static int __init simtempInit(void)
       return retVal;
    }
 
-   pr_info("INIT: Iniciando\n");
+   pr_info("SIMTEMP INIT: Iniciando\n");
 
    retVal = platform_driver_register(&simtemp_platform_driver);
    if (retVal)
    {
-      pr_info("INIT: falló ret = platform_driver_register(&simtemp_platform_driver); fin de INIT\n");
+      pr_info("SIMTEMP INIT: falló ret = platform_driver_register(&simtemp_platform_driver); fin de INIT\n");
       return retVal;
    }
 
@@ -940,11 +966,11 @@ static int __init simtempInit(void)
    /* Fallback: crea un platform_device solo si NO hay DT poblado */
    if (!of_have_populated_dt()) 
    {
-      pr_info("INIT: no hay DT poblado :  creando fallback platform_device\n");
+      pr_info("SIMTEMP INIT: no hay DT poblado :  creando fallback platform_device\n");
       simtemp_pdev_fallback = platform_device_register_simple("nxp_simtemp", PLATFORM_DEVID_AUTO, NULL, 0);
       if (IS_ERR(simtemp_pdev_fallback)) 
       {
-         pr_info("INIT: No se pudo crear fallback, se cancela todo.\n");
+         pr_info("SIMTEMP INIT: No se pudo crear fallback, se cancela todo.\n");
          retVal = PTR_ERR(simtemp_pdev_fallback);
          platform_driver_unregister(&simtemp_platform_driver);
          return retVal;
@@ -971,14 +997,15 @@ static int __init simtempInit(void)
 
 static void __exit simtempExit(void)
 {
-   wake_up_interruptible_all(&simtempWait);
    timerDeInit();
+   wake_up_interruptible_all(&simtempWait);
+
    if (simtemp_pdev_fallback && !IS_ERR(simtemp_pdev_fallback)) {
       platform_device_unregister(simtemp_pdev_fallback);
       simtemp_pdev_fallback = NULL;
    }
    platform_driver_unregister(&simtemp_platform_driver);
-   pr_info("EXIT: platform driver unregistered\n");
+   pr_info("SIMTEMP EXIT: platform driver unregistered\n");
 
 
    if (simtempMiscDev.this_device)
@@ -989,6 +1016,7 @@ static void __exit simtempExit(void)
    misc_deregister(&simtempMiscDev);
    pr_info("simtemp: Unloaded.\n");
 }
+
 
 module_init(simtempInit);
 module_exit(simtempExit);

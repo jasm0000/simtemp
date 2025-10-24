@@ -40,7 +40,8 @@ enum COMMAND_TYPE
    CMD_SET_MODE,
    CMD_SET_THRESHOLD,
    CMD_SHOW_ALL,
-   CMD_TEST
+   CMD_TEST,
+   CMD_WAIT_ALERT
 };
 
 /****************************************************************************/
@@ -59,14 +60,22 @@ struct __attribute__((packed)) SimtempRecord16
 };
 
 /* Make human-readable output from a decoded 16B record. */
-static void printSampleHuman(const SimtempRecord16& r)
-{
-   double t_ms = static_cast<double>(r.timestamp_ns) / 1e6;
-   double t_C  = static_cast<double>(r.temp_mC) / 1000.0;
-   unsigned alert = (r.flags & (1u << 1)) ? 1u : 0u;
-   cout << "t_ms=" << t_ms << " temp=" << t_C << "C alert=" << alert << "\n";
-}
+#include <iomanip>
+#include <iostream>
 
+#include <iomanip>
+#include <iostream>
+
+static void printSampleHuman(const SimtempRecord16& r) 
+{ 
+   double t_ms = static_cast<double>(r.timestamp_ns) / 1e6; 
+   double t_C = static_cast<double>(r.temp_mC) / 1000.0; 
+   unsigned alert = (r.flags & (1u << 1)) ? 1u : 0u; 
+   cout << "t_ms = " << t_ms 
+        << " temp = " << t_C 
+        << "C Thresh. alert = " 
+        << alert << "\n"; 
+}
 /* enum to report how a read attempt finished. */
 enum READ_RESULT
 {
@@ -85,7 +94,7 @@ enum READ_RESULT
 
 static void printHelp()
 {
-   cout << "simtempCLI (hello)\n";
+   cout << "simtempCLI (Temperature Simulator - CLI, Version 1.0)\n";
    cout << "Usage:\n";
    cout << "   ./simtempCLI --once              [--nonblock] [--timeout MS]\n";
    cout << "   ./simtempCLI --follow            [--nonblock] [--timeout MS] [--reopen]\n";
@@ -94,6 +103,7 @@ static void printHelp()
    cout << "   ./simtempCLI --set-threshold mC\n";
    cout << "   ./simtempCLI --show-all\n";
    cout << "   ./simtempCLI --test --period MS\n";
+   cout << "   ./simtempCli --wait-alert [--timeout MS]\n";
    cout << "\nNotes:\n";
    cout << " - --set-sampling writes /sys/class/misc/simtemp/sampling_ms\n";
    cout << " - --set-mode writes /sys/class/misc/simtemp/mode\n";
@@ -102,6 +112,7 @@ static void printHelp()
    cout << " - --timeout applies to --once and --follow; use -1 for infinite wait\n";
    cout << " - --reopen performs reopen at EOF, in cat command style\n";
    cout << " - --test: forces mode=ramp, uses --period MS, auto-sets threshold and waits for POLLPRI (<= ~2*period)\n";
+   cout << " - --wait-alert blocks until a threshold alert arrives (POLLPRI) or timeout\n";
    cout << " - You can combine --set-xxx with --once/--follow (set first, then read)\n";
 }
 
@@ -302,7 +313,7 @@ static enum READ_RESULT readBinaryOrTextOnce(int fd)
       std::copy_n(recBuf, sizeof(recBuf), reinterpret_cast<unsigned char*>(&rec));
 
 
-      cout << "Read from driver (16 bytes):\n";
+      cout << "Read from driver: ";
       printSampleHuman(rec);
       cout.flush();
       return RR_OK;
@@ -690,6 +701,72 @@ static bool readFollow(bool nonblock, int timeoutMs, bool reopenOnEof)
 
 /****************************************************************************/
 /****************************************************************************/
+/*****************************  WAIT ALERT  *********************************/
+/****************************************************************************/
+/****************************************************************************/
+
+// Waits only for POLLPRI from /dev/simtemp.
+// - Returns true if an alert arrives within timeoutMs.
+// - Returns false on timeout or error.
+// - Does not consume normal data; only reacts to POLLPRI.
+static bool waitAlertOnly(int timeoutMs)
+{
+   int fd = open(devPath, O_RDONLY);
+   if (fd < 0)
+   {
+      cerr << "ERROR: Could not open " << devPath << " (" << strerror(errno) << ")\n";
+      return false;
+   }
+
+   struct pollfd pfd;
+   pfd.fd = fd;
+   pfd.events = POLLPRI;   // we only care about threshold alerts here
+
+   int ret = poll(&pfd, 1, timeoutMs);
+   if (ret < 0)
+   {
+      if (errno == EINTR)
+      {
+         // interrupted by signal; treat as failure for this helper
+         cerr << "ERROR: poll interrupted (" << strerror(errno) << ")\n";
+      }
+      else
+      {
+         cerr << "ERROR: poll failed (" << strerror(errno) << ")\n";
+      }
+      close(fd);
+      return false;
+   }
+   if (ret == 0)
+   {
+      cerr << "TIMEOUT: no alert received in " << timeoutMs << " ms\n";
+      close(fd);
+      return false;
+   }
+
+   if ((pfd.revents & POLLPRI) == 0)
+   {
+      // Some other event happened; for this mode, we treat it as failure.
+      cerr << "Unexpected event (revents=0x"
+           << std::hex << pfd.revents << std::dec << ") without POLLPRI\n";
+      close(fd);
+      return false;
+   }
+
+   // Optional: one read to clear the condition (format agnostic).
+   // Not strictly required; safe to leave as best-effort.
+   char buf[32] = {0};
+   ssize_t n = read(fd, buf, sizeof(buf));
+   (void)n;
+
+   cout << "[wait-alert] Threshold alert detected (POLLPRI)\n";
+   close(fd);
+   return true;
+}
+
+
+/****************************************************************************/
+/****************************************************************************/
 /********************************  M A I N  *********************************/
 /****************************************************************************/
 /****************************************************************************/
@@ -762,6 +839,10 @@ int main(int argc, char** argv)
       {
          testPeriodMs = stoi(argv[++i]);
       }
+      else if (arg == "--wait-alert")
+      {
+         command = CMD_WAIT_ALERT;
+      }
       else
       {
          cerr << "Unknown parameters: " << arg << endl;
@@ -815,7 +896,14 @@ int main(int argc, char** argv)
          }
          return 0;
 
-      case CMD_NONE:
+      case CMD_WAIT_ALERT:
+         if (!waitAlertOnly(timeoutMs))
+         {
+            return 1;
+         }
+         return 0;
+
+         case CMD_NONE:
          break;
    }
 
